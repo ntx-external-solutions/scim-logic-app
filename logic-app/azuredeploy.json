@@ -255,7 +255,7 @@
                     ]
                   },
                   "type": "Compose",
-                  "inputs": "@union(if(not(equals(outputs('Map_department_role'), null)), createArray(outputs('Map_department_role')), createArray()), body('Map_group_roles'))"
+                  "inputs": "@union(coalesce(outputs('Map_department_role'), createArray()), body('Map_group_roles'))"
                 }
               },
               "else": {
