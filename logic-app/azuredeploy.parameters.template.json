@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "logicAppName": {
+      "value": "ProcessManagerSCIMSync"
+    },
+    "scimApiKey": {
+      "value": "YOUR_SCIM_API_KEY_HERE"
+    },
+    "roleMappingStorageAccountName": {
+      "value": "YOUR_STORAGE_ACCOUNT_NAME"
+    },
+    "roleMappingContainerName": {
+      "value": "config"
+    },
+    "updateMode": {
+      "value": "preserve"
+    },
+    "mappingMode": {
+      "value": "dynamic"
+    }
+  }
+}
