@@ -355,14 +355,37 @@
                       "type": "Compose",
                       "inputs": "@first(body('Parse_SCIM_response')?['Resources'])"
                     },
-                    "Prepare_roles_array": {
+                    "Normalize_dept_roles_to_array": {
                       "runAfter": {
                         "Set_user_variable": [
                           "Succeeded"
                         ]
                       },
                       "type": "Compose",
-                      "inputs": "@if(equals(parameters('updateMode'), 'replace'), createArray(json(concat('{\"display\":\"', outputs('Determine_final_role'), '\"}'))), union(coalesce(outputs('Set_user_variable')?['roles'], createArray()), createArray(json(concat('{\"display\":\"', outputs('Determine_final_role'), '\"}')))))"
+                      "inputs": "@if(equals(parameters('mappingMode'), 'mapped'), coalesce(outputs('Determine_final_role'), createArray()), if(not(equals(outputs('Determine_final_role'), null)), createArray(outputs('Determine_final_role')), createArray()))"
+                    },
+                    "Create_dept_role_objects": {
+                      "runAfter": {
+                        "Normalize_dept_roles_to_array": [
+                          "Succeeded"
+                        ]
+                      },
+                      "type": "Select",
+                      "inputs": {
+                        "from": "@outputs('Normalize_dept_roles_to_array')",
+                        "select": {
+                          "display": "@item()"
+                        }
+                      }
+                    },
+                    "Prepare_roles_array": {
+                      "runAfter": {
+                        "Create_dept_role_objects": [
+                          "Succeeded"
+                        ]
+                      },
+                      "type": "Compose",
+                      "inputs": "@if(equals(parameters('updateMode'), 'replace'), body('Create_dept_role_objects'), union(coalesce(outputs('Set_user_variable')?['roles'], createArray()), body('Create_dept_role_objects')))"
                     },
                     "Update_SCIM_user": {
                       "runAfter": {

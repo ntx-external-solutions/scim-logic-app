@@ -1,14 +1,14 @@
 {
   "departmentMapping": {
-    "Engineering": "Engineering Team",
-    "Sales": "Sales Team",
-    "Marketing": "Marketing Team",
-    "HR": "Human Resources",
-    "Finance": "Finance Team",
-    "IT": "IT Support",
-    "Operations": "Operations Team",
-    "Customer Success": "Customer Success",
-    "_default": "Standard User"
+    "Engineering": ["Engineering Team"],
+    "Sales": ["Sales Team"],
+    "Marketing": ["Marketing Team"],
+    "HR": ["Human Resources"],
+    "Finance": ["Finance Team"],
+    "IT": ["IT Support"],
+    "Operations": ["Operations Team"],
+    "Customer Success": ["Customer Success"],
+    "_default": ["Standard User"]
   },
   "groupMapping": {
     "ProcessManager-Admins": "Administrator",
@@ -20,12 +20,13 @@
     "description": "Maps Entra ID departments and groups to Process Manager roles",
     "lastUpdated": "2026-03-03",
     "notes": [
-      "departmentMapping: Maps the 'Department' field from Entra ID user profile",
-      "groupMapping: Maps Entra ID security group names (not yet implemented in Logic App)",
-      "_default: Fallback role when no mapping is found",
+      "departmentMapping: Maps the 'Department' field from Entra ID user profile to an array of role names",
+      "departmentMapping values MUST be arrays — a department can map to one or more roles",
+      "groupMapping: Maps Entra ID security group names to a single role name string",
+      "_default: Fallback role(s) when no mapping is found",
       "Role names must exactly match the 'display' names in Process Manager",
       "This file is ONLY used when mappingMode is set to 'mapped'",
-      "When using 'dynamic' mode, the department name is used directly as the role"
+      "When using 'dynamic' mode, the department name is used directly as a single role"
     ]
   }
 }
