@@ -307,7 +307,7 @@
                         "type": "SetVariable",
                         "inputs": {
                           "name": "newDeltaLink",
-                          "value": "@{body('Call_graph_delta')?['@odata.deltaLink']}"
+                          "value": "@{if(not(equals(body('Call_graph_delta')?['@odata.deltaLink'], null)), body('Call_graph_delta')?['@odata.deltaLink'], variables('currentUrl'))}"
                         }
                       },
                       "Mark_pagination_complete": {

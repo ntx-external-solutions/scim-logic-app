@@ -11,6 +11,27 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Temp file cleanup trap
+PARAMS_FILE=""
+cleanup() {
+    if [ -n "$PARAMS_FILE" ] && [ -f "$PARAMS_FILE" ]; then
+        rm -f "$PARAMS_FILE"
+    fi
+    unset SCIM_API_KEY
+    unset STORAGE_KEY
+}
+trap cleanup EXIT
+
+# Input validation: alphanumeric and hyphens only
+validate_resource_name() {
+    local name="$1"
+    local label="$2"
+    if ! echo "$name" | grep -qE '^[a-zA-Z0-9-]+$'; then
+        echo -e "${RED}✗ ${label} contains invalid characters. Only alphanumeric characters and hyphens are allowed.${NC}"
+        exit 1
+    fi
+}
+
 echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║   Process Manager SCIM Sync - Azure Deployment Script     ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
@@ -35,20 +56,25 @@ echo ""
 # Prompt for configuration
 read -p "Enter Resource Group name [rg-processmanager-scim]: " RESOURCE_GROUP
 RESOURCE_GROUP=${RESOURCE_GROUP:-rg-processmanager-scim}
+validate_resource_name "$RESOURCE_GROUP" "Resource Group name"
 
 read -p "Enter Azure region [eastus]: " LOCATION
 LOCATION=${LOCATION:-eastus}
+validate_resource_name "$LOCATION" "Azure region"
 
 read -p "Enter Logic App name [ProcessManagerSCIMSync]: " LOGIC_APP_NAME
 LOGIC_APP_NAME=${LOGIC_APP_NAME:-ProcessManagerSCIMSync}
+validate_resource_name "$LOGIC_APP_NAME" "Logic App name"
 
 echo ""
 echo -e "${YELLOW}⚠ Storage Account name must be globally unique (3-24 lowercase letters and numbers)${NC}"
 read -p "Enter Storage Account name [pmscimconfig$(date +%s)]: " STORAGE_ACCOUNT
 STORAGE_ACCOUNT=${STORAGE_ACCOUNT:-pmscimconfig$(date +%s)}
+validate_resource_name "$STORAGE_ACCOUNT" "Storage Account name"
 
 read -p "Enter Storage Container name [config]: " CONTAINER_NAME
 CONTAINER_NAME=${CONTAINER_NAME:-config}
+validate_resource_name "$CONTAINER_NAME" "Storage Container name"
 
 echo ""
 echo -e "${YELLOW}⚠ Your SCIM API key will be stored securely but will be visible to Logic App editors${NC}"
@@ -81,6 +107,20 @@ if [ "$MAPPING_MODE" != "dynamic" ] && [ "$MAPPING_MODE" != "mapped" ]; then
 fi
 
 echo ""
+read -p "Enter polling interval in minutes (1-60) [5]: " POLLING_INTERVAL
+POLLING_INTERVAL=${POLLING_INTERVAL:-5}
+
+if ! echo "$POLLING_INTERVAL" | grep -qE '^[0-9]+$'; then
+    echo -e "${RED}✗ Polling interval must be a number${NC}"
+    exit 1
+fi
+
+if [ "$POLLING_INTERVAL" -lt 1 ] || [ "$POLLING_INTERVAL" -gt 60 ]; then
+    echo -e "${RED}✗ Polling interval must be between 1 and 60 minutes${NC}"
+    exit 1
+fi
+
+echo ""
 echo -e "${GREEN}Configuration Summary:${NC}"
 echo "  Resource Group: $RESOURCE_GROUP"
 echo "  Location: $LOCATION"
@@ -89,6 +129,7 @@ echo "  Storage Account: $STORAGE_ACCOUNT"
 echo "  Container: $CONTAINER_NAME"
 echo "  Update Mode: $UPDATE_MODE"
 echo "  Mapping Mode: $MAPPING_MODE"
+echo "  Polling Interval: ${POLLING_INTERVAL} minutes"
 echo ""
 
 read -p "Proceed with deployment? (y/n): " CONFIRM
@@ -103,43 +144,46 @@ echo ""
 
 # Step 1: Create Resource Group
 echo -e "${YELLOW}[1/6]${NC} Creating resource group..."
-if az group show --name $RESOURCE_GROUP &> /dev/null; then
+if az group show --name "$RESOURCE_GROUP" &> /dev/null; then
     echo -e "${GREEN}  ✓ Resource group already exists${NC}"
 else
-    az group create --name $RESOURCE_GROUP --location $LOCATION --output none
+    az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
     echo -e "${GREEN}  ✓ Resource group created${NC}"
 fi
 
 # Step 2: Create Storage Account
 echo -e "${YELLOW}[2/6]${NC} Creating storage account..."
-if az storage account show --name $STORAGE_ACCOUNT --resource-group $RESOURCE_GROUP &> /dev/null; then
+if az storage account show --name "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" &> /dev/null; then
     echo -e "${GREEN}  ✓ Storage account already exists${NC}"
 else
     az storage account create \
-        --name $STORAGE_ACCOUNT \
-        --resource-group $RESOURCE_GROUP \
-        --location $LOCATION \
+        --name "$STORAGE_ACCOUNT" \
+        --resource-group "$RESOURCE_GROUP" \
+        --location "$LOCATION" \
         --sku Standard_LRS \
         --kind StorageV2 \
+        --https-only true \
+        --min-tls-version TLS1_2 \
+        --allow-blob-public-access false \
         --output none
     echo -e "${GREEN}  ✓ Storage account created${NC}"
 fi
 
 # Get storage key
 STORAGE_KEY=$(az storage account keys list \
-    --resource-group $RESOURCE_GROUP \
-    --account-name $STORAGE_ACCOUNT \
+    --resource-group "$RESOURCE_GROUP" \
+    --account-name "$STORAGE_ACCOUNT" \
     --query '[0].value' -o tsv)
 
 # Step 3: Create Container
 echo -e "${YELLOW}[3/6]${NC} Creating storage container..."
-if az storage container show --name $CONTAINER_NAME --account-name $STORAGE_ACCOUNT --account-key $STORAGE_KEY &> /dev/null; then
+if az storage container show --name "$CONTAINER_NAME" --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" &> /dev/null; then
     echo -e "${GREEN}  ✓ Container already exists${NC}"
 else
     az storage container create \
-        --name $CONTAINER_NAME \
-        --account-name $STORAGE_ACCOUNT \
-        --account-key $STORAGE_KEY \
+        --name "$CONTAINER_NAME" \
+        --account-name "$STORAGE_ACCOUNT" \
+        --account-key "$STORAGE_KEY" \
         --output none
     echo -e "${GREEN}  ✓ Container created${NC}"
 fi
@@ -154,9 +198,9 @@ if [ "$MAPPING_MODE" = "mapped" ]; then
     fi
 
     az storage blob upload \
-        --account-name $STORAGE_ACCOUNT \
-        --account-key $STORAGE_KEY \
-        --container-name $CONTAINER_NAME \
+        --account-name "$STORAGE_ACCOUNT" \
+        --account-key "$STORAGE_KEY" \
+        --container-name "$CONTAINER_NAME" \
         --name role-mapping.json \
         --file ./config/role-mapping.json \
         --overwrite \
@@ -168,7 +212,9 @@ fi
 
 # Step 5: Create Parameters File
 echo -e "${YELLOW}[5/6]${NC} Generating deployment parameters..."
-cat > /tmp/azuredeploy.parameters.json <<EOF
+umask 077
+PARAMS_FILE=$(mktemp "${TMPDIR:-/tmp}/azuredeploy.parameters.XXXXXX.json")
+cat > "$PARAMS_FILE" <<EOF
 {
   "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
   "contentVersion": "1.0.0.0",
@@ -190,6 +236,9 @@ cat > /tmp/azuredeploy.parameters.json <<EOF
     },
     "mappingMode": {
       "value": "$MAPPING_MODE"
+    },
+    "pollingIntervalMinutes": {
+      "value": $POLLING_INTERVAL
     }
   }
 }
@@ -199,20 +248,19 @@ echo -e "${GREEN}  ✓ Parameters file created${NC}"
 # Step 6: Deploy Logic App
 echo -e "${YELLOW}[6/6]${NC} Deploying Logic App (this may take a few minutes)..."
 DEPLOYMENT_OUTPUT=$(az deployment group create \
-    --resource-group $RESOURCE_GROUP \
+    --resource-group "$RESOURCE_GROUP" \
     --template-file ./logic-app/azuredeploy.json \
-    --parameters /tmp/azuredeploy.parameters.json \
-    --output json)
+    --parameters "$PARAMS_FILE" \
+    --output json 2>&1) || true
 
-if [ $? -eq 0 ]; then
+if echo "$DEPLOYMENT_OUTPUT" | grep -q '"provisioningState": "Succeeded"'; then
     echo -e "${GREEN}  ✓ Logic App deployed successfully${NC}"
 else
     echo -e "${RED}  ✗ Deployment failed${NC}"
+    echo -e "${RED}  Error details:${NC}"
+    echo "$DEPLOYMENT_OUTPUT" | head -50
     exit 1
 fi
-
-# Clean up temp parameters file
-rm /tmp/azuredeploy.parameters.json
 
 echo ""
 echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"

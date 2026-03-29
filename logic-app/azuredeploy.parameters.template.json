@@ -19,6 +19,9 @@
     },
     "mappingMode": {
       "value": "dynamic"
+    },
+    "pollingIntervalMinutes": {
+      "value": 5
     }
   }
 }

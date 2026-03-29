@@ -1,14 +1,14 @@
 {
   "departmentMapping": {
-    "Engineering": ["Engineering Team"],
-    "Sales": ["Sales Team"],
-    "Marketing": ["Marketing Team"],
-    "HR": ["Human Resources"],
-    "Finance": ["Finance Team"],
-    "IT": ["IT Support"],
-    "Operations": ["Operations Team"],
-    "Customer Success": ["Customer Success"],
-    "_default": ["Standard User"]
+    "Engineering": "Engineering Team",
+    "Sales": "Sales Team",
+    "Marketing": "Marketing Team",
+    "HR": "Human Resources",
+    "Finance": "Finance Team",
+    "IT": "IT Support",
+    "Operations": "Operations Team",
+    "Customer Success": "Customer Success",
+    "_default": "Standard User"
   },
   "groupMapping": {
     "ProcessManager-Admins": "Administrator",
@@ -20,8 +20,8 @@
     "description": "Maps Entra ID departments and groups to Process Manager roles",
     "lastUpdated": "2026-03-03",
     "notes": [
-      "departmentMapping: Maps the 'Department' field from Entra ID user profile to an array of role names",
-      "departmentMapping values MUST be arrays — a department can map to one or more roles",
+      "departmentMapping: Maps the 'Department' field from Entra ID user profile to a single role name string",
+      "departmentMapping values are strings, matching the same format as groupMapping",
       "groupMapping: Maps Entra ID security group names to a single role name string",
       "_default: Fallback role(s) when no mapping is found",
       "Role names must exactly match the 'display' names in Process Manager",
