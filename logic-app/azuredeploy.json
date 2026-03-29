@@ -25,7 +25,7 @@
     "roleMappingStorageAccountName": {
       "type": "string",
       "metadata": {
-        "description": "Storage account name where role-mapping.json is stored"
+        "description": "Storage account name where role-mapping.json and delta token are stored"
       }
     },
     "roleMappingContainerName": {
@@ -56,25 +56,21 @@
       "metadata": {
         "description": "Mapping mode: dynamic (use names as-is) or mapped (use role-mapping.json)"
       }
+    },
+    "pollingIntervalMinutes": {
+      "type": "int",
+      "defaultValue": 5,
+      "minValue": 1,
+      "maxValue": 60,
+      "metadata": {
+        "description": "How often (in minutes) to poll Microsoft Graph for user changes"
+      }
     }
   },
   "variables": {
-    "office365ConnectionName": "[concat('office365-', uniqueString(resourceGroup().id))]",
     "azureblobConnectionName": "[concat('azureblob-', uniqueString(resourceGroup().id))]"
   },
   "resources": [
-    {
-      "type": "Microsoft.Web/connections",
-      "apiVersion": "2016-06-01",
-      "name": "[variables('office365ConnectionName')]",
-      "location": "[parameters('location')]",
-      "properties": {
-        "displayName": "Office 365 Users Connection",
-        "api": {
-          "id": "[concat(subscription().id, '/providers/Microsoft.Web/locations/', parameters('location'), '/managedApis/office365users')]"
-        }
-      }
-    },
     {
       "type": "Microsoft.Web/connections",
       "apiVersion": "2016-06-01",
@@ -97,9 +93,11 @@
       "name": "[parameters('logicAppName')]",
       "location": "[parameters('location')]",
       "dependsOn": [
-        "[resourceId('Microsoft.Web/connections', variables('office365ConnectionName'))]",
         "[resourceId('Microsoft.Web/connections', variables('azureblobConnectionName'))]"
       ],
+      "identity": {
+        "type": "SystemAssigned"
+      },
       "properties": {
         "state": "Enabled",
         "definition": {
@@ -124,42 +122,79 @@
             }
           },
           "triggers": {
-            "When_a_user_is_updated": {
-              "type": "ApiConnectionWebhook",
-              "inputs": {
-                "host": {
-                  "connection": {
-                    "name": "@parameters('$connections')['office365users']['connectionId']"
-                  }
-                },
-                "body": {
-                  "NotificationUrl": "@{listCallbackUrl()}"
-                },
-                "path": "/GraphSubscriptionPush",
-                "queries": {
-                  "subscriptionRequest/resource": "users",
-                  "subscriptionRequest/changeType": "updated"
-                }
+            "Recurrence": {
+              "type": "Recurrence",
+              "recurrence": {
+                "frequency": "Minute",
+                "interval": "[parameters('pollingIntervalMinutes')]"
               }
             }
           },
           "actions": {
-            "Get_user_profile": {
+            "Initialize_changed_users": {
               "runAfter": {},
-              "type": "ApiConnection",
+              "type": "InitializeVariable",
               "inputs": {
-                "host": {
-                  "connection": {
-                    "name": "@parameters('$connections')['office365users']['connectionId']"
+                "variables": [
+                  {
+                    "name": "changedUsers",
+                    "type": "array",
+                    "value": []
                   }
-                },
-                "method": "get",
-                "path": "/users/@{encodeURIComponent(triggerBody()?['userId'])}"
+                ]
               }
             },
-            "Get_user_groups": {
+            "Initialize_has_more_pages": {
+              "runAfter": {},
+              "type": "InitializeVariable",
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "hasMorePages",
+                    "type": "boolean",
+                    "value": true
+                  }
+                ]
+              }
+            },
+            "Initialize_current_url": {
+              "runAfter": {},
+              "type": "InitializeVariable",
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "currentUrl",
+                    "type": "string",
+                    "value": ""
+                  }
+                ]
+              }
+            },
+            "Initialize_new_delta_link": {
+              "runAfter": {},
+              "type": "InitializeVariable",
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "newDeltaLink",
+                    "type": "string",
+                    "value": ""
+                  }
+                ]
+              }
+            },
+            "Get_saved_delta_token": {
               "runAfter": {
-                "Get_user_profile": [
+                "Initialize_changed_users": [
+                  "Succeeded"
+                ],
+                "Initialize_has_more_pages": [
+                  "Succeeded"
+                ],
+                "Initialize_current_url": [
+                  "Succeeded"
+                ],
+                "Initialize_new_delta_link": [
                   "Succeeded"
                 ]
               },
@@ -167,16 +202,178 @@
               "inputs": {
                 "host": {
                   "connection": {
-                    "name": "@parameters('$connections')['office365users']['connectionId']"
+                    "name": "@parameters('$connections')['azureblob']['connectionId']"
                   }
                 },
                 "method": "get",
-                "path": "/users/@{encodeURIComponent(body('Get_user_profile')?['Mail'])}/memberOf"
+                "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent('config/delta-token.txt'))}/content",
+                "headers": {
+                  "inferContentType": true
+                }
+              }
+            },
+            "Set_delta_url": {
+              "runAfter": {
+                "Get_saved_delta_token": [
+                  "Succeeded",
+                  "Failed"
+                ]
+              },
+              "type": "SetVariable",
+              "inputs": {
+                "name": "currentUrl",
+                "value": "@{if(equals(actions('Get_saved_delta_token')['status'], 'Succeeded'), trim(string(body('Get_saved_delta_token'))), 'https://graph.microsoft.com/v1.0/users/delta?$select=id,mail,department,displayName,userPrincipalName&$deltatoken=latest')}"
+              }
+            },
+            "Follow_delta_pages": {
+              "runAfter": {
+                "Set_delta_url": [
+                  "Succeeded"
+                ]
+              },
+              "type": "Until",
+              "expression": "@equals(variables('hasMorePages'), false)",
+              "limit": {
+                "count": 50,
+                "timeout": "PT5M"
+              },
+              "actions": {
+                "Call_graph_delta": {
+                  "runAfter": {},
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@variables('currentUrl')",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "https://graph.microsoft.com"
+                    }
+                  }
+                },
+                "Compute_merged_users": {
+                  "runAfter": {
+                    "Call_graph_delta": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "Compose",
+                  "inputs": "@union(variables('changedUsers'), if(not(equals(body('Call_graph_delta')?['value'], null)), body('Call_graph_delta')?['value'], json('[]')))"
+                },
+                "Set_changed_users": {
+                  "runAfter": {
+                    "Compute_merged_users": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "changedUsers",
+                    "value": "@outputs('Compute_merged_users')"
+                  }
+                },
+                "Check_for_more_pages": {
+                  "runAfter": {
+                    "Set_changed_users": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "If",
+                  "expression": {
+                    "and": [
+                      {
+                        "not": {
+                          "equals": [
+                            "@body('Call_graph_delta')?['@odata.nextLink']",
+                            null
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  "actions": {
+                    "Set_next_page_url": {
+                      "runAfter": {},
+                      "type": "SetVariable",
+                      "inputs": {
+                        "name": "currentUrl",
+                        "value": "@{body('Call_graph_delta')?['@odata.nextLink']}"
+                      }
+                    }
+                  },
+                  "else": {
+                    "actions": {
+                      "Store_delta_link": {
+                        "runAfter": {},
+                        "type": "SetVariable",
+                        "inputs": {
+                          "name": "newDeltaLink",
+                          "value": "@{body('Call_graph_delta')?['@odata.deltaLink']}"
+                        }
+                      },
+                      "Mark_pagination_complete": {
+                        "runAfter": {
+                          "Store_delta_link": [
+                            "Succeeded"
+                          ]
+                        },
+                        "type": "SetVariable",
+                        "inputs": {
+                          "name": "hasMorePages",
+                          "value": false
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "Delete_old_delta_token": {
+              "runAfter": {
+                "Follow_delta_pages": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['azureblob']['connectionId']"
+                  }
+                },
+                "method": "delete",
+                "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent('config/delta-token.txt'))}"
+              }
+            },
+            "Save_delta_token": {
+              "runAfter": {
+                "Delete_old_delta_token": [
+                  "Succeeded",
+                  "Failed"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['azureblob']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "path": "/datasets/default/files",
+                "body": "@variables('newDeltaLink')",
+                "queries": {
+                  "folderPath": "/config",
+                  "name": "delta-token.txt",
+                  "queryParametersSingleEncoded": true
+                },
+                "headers": {
+                  "Content-Type": "text/plain"
+                }
               }
             },
             "Check_mapping_mode": {
               "runAfter": {
-                "Get_user_groups": [
+                "Save_delta_token": [
                   "Succeeded"
                 ]
               },
@@ -226,243 +423,322 @@
                       }
                     }
                   }
-                },
-                "Map_department_role": {
-                  "runAfter": {
-                    "Parse_role_mapping": [
-                      "Succeeded"
-                    ]
-                  },
-                  "type": "Compose",
-                  "inputs": "@coalesce(body('Parse_role_mapping')?['departmentMapping']?[body('Get_user_profile')?['Department']], body('Parse_role_mapping')?['departmentMapping']?['_default'])"
-                },
-                "Map_group_roles": {
-                  "runAfter": {
-                    "Map_department_role": [
-                      "Succeeded"
-                    ]
-                  },
-                  "type": "Select",
-                  "inputs": {
-                    "from": "@body('Get_user_groups')?['value']",
-                    "select": "@coalesce(body('Parse_role_mapping')?['groupMapping']?[item()?['displayName']], body('Parse_role_mapping')?['groupMapping']?['_default'])"
-                  }
-                },
-                "Combine_mapped_roles": {
-                  "runAfter": {
-                    "Map_group_roles": [
-                      "Succeeded"
-                    ]
-                  },
-                  "type": "Compose",
-                  "inputs": "@union(coalesce(outputs('Map_department_role'), createArray()), body('Map_group_roles'))"
                 }
               },
               "else": {
-                "actions": {
-                  "Get_department_role": {
-                    "runAfter": {},
-                    "type": "Compose",
-                    "inputs": "@body('Get_user_profile')?['Department']"
-                  },
-                  "Get_group_role_names": {
-                    "runAfter": {
-                      "Get_department_role": [
-                        "Succeeded"
-                      ]
-                    },
-                    "type": "Select",
-                    "inputs": {
-                      "from": "@body('Get_user_groups')?['value']",
-                      "select": "@item()?['displayName']"
-                    }
-                  },
-                  "Combine_dynamic_roles": {
-                    "runAfter": {
-                      "Get_group_role_names": [
-                        "Succeeded"
-                      ]
-                    },
-                    "type": "Compose",
-                    "inputs": "@union(if(not(equals(outputs('Get_department_role'), null)), createArray(outputs('Get_department_role')), createArray()), body('Get_group_role_names'))"
-                  }
-                }
+                "actions": {}
               }
             },
-            "Determine_all_roles": {
+            "For_each_changed_user": {
               "runAfter": {
                 "Check_mapping_mode": [
                   "Succeeded"
                 ]
               },
-              "type": "Compose",
-              "inputs": "@if(equals(parameters('mappingMode'), 'mapped'), body('Combine_mapped_roles'), body('Combine_dynamic_roles'))"
-            },
-            "Filter_null_roles": {
-              "runAfter": {
-                "Determine_all_roles": [
-                  "Succeeded"
-                ]
-              },
-              "type": "Query",
-              "inputs": {
-                "from": "@outputs('Determine_all_roles')",
-                "where": "@and(not(equals(item(), null)), not(equals(item(), '')))"
-              }
-            },
-            "Check_if_roles_found": {
-              "runAfter": {
-                "Filter_null_roles": [
-                  "Succeeded"
-                ]
-              },
-              "type": "If",
-              "expression": {
-                "and": [
-                  {
-                    "greater": [
-                      "@length(body('Filter_null_roles'))",
-                      0
-                    ]
-                  }
-                ]
+              "type": "Foreach",
+              "foreach": "@variables('changedUsers')",
+              "runtimeConfiguration": {
+                "concurrency": {
+                  "repetitions": 5
+                }
               },
               "actions": {
-                "Get_SCIM_user": {
+                "Check_user_has_mail": {
                   "runAfter": {},
-                  "type": "Http",
-                  "inputs": {
-                    "method": "GET",
-                    "uri": "https://api.promapp.com/api/scim/users?filter=userName eq \"@{body('Get_user_profile')?['Mail']}\"",
-                    "headers": {
-                      "Authorization": "Bearer @{parameters('scimApiKey')}",
-                      "Content-Type": "application/json"
-                    }
-                  }
-                },
-                "Parse_SCIM_response": {
-                  "runAfter": {
-                    "Get_SCIM_user": [
-                      "Succeeded"
-                    ]
-                  },
-                  "type": "ParseJson",
-                  "inputs": {
-                    "content": "@body('Get_SCIM_user')",
-                    "schema": {
-                      "type": "object",
-                      "properties": {
-                        "Resources": {
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "properties": {
-                              "id": {
-                                "type": "string"
-                              },
-                              "userName": {
-                                "type": "string"
-                              },
-                              "name": {
-                                "type": "object",
-                                "properties": {
-                                  "givenName": {
-                                    "type": "string"
-                                  },
-                                  "familyName": {
-                                    "type": "string"
-                                  }
-                                }
-                              },
-                              "active": {
-                                "type": "boolean"
-                              },
-                              "emails": {
-                                "type": "array"
-                              },
-                              "roles": {
-                                "type": "array"
-                              }
-                            }
-                          }
-                        },
-                        "totalResults": {
-                          "type": "integer"
-                        }
-                      }
-                    }
-                  }
-                },
-                "Check_if_user_exists": {
-                  "runAfter": {
-                    "Parse_SCIM_response": [
-                      "Succeeded"
-                    ]
-                  },
                   "type": "If",
                   "expression": {
                     "and": [
                       {
-                        "greater": [
-                          "@body('Parse_SCIM_response')?['totalResults']",
-                          0
-                        ]
+                        "not": {
+                          "equals": [
+                            "@coalesce(items('For_each_changed_user')?['mail'], items('For_each_changed_user')?['userPrincipalName'])",
+                            null
+                          ]
+                        }
+                      },
+                      {
+                        "not": {
+                          "equals": [
+                            "@coalesce(items('For_each_changed_user')?['mail'], items('For_each_changed_user')?['userPrincipalName'])",
+                            ""
+                          ]
+                        }
                       }
                     ]
                   },
                   "actions": {
-                    "Set_user_variable": {
+                    "Get_user_groups": {
                       "runAfter": {},
-                      "type": "Compose",
-                      "inputs": "@first(body('Parse_SCIM_response')?['Resources'])"
-                    },
-                    "Create_role_objects": {
-                      "runAfter": {
-                        "Set_user_variable": [
-                          "Succeeded"
-                        ]
-                      },
-                      "type": "Select",
+                      "type": "Http",
                       "inputs": {
-                        "from": "@body('Filter_null_roles')",
-                        "select": {
-                          "display": "@item()"
+                        "method": "GET",
+                        "uri": "https://graph.microsoft.com/v1.0/users/@{items('For_each_changed_user')?['id']}/memberOf?$select=displayName",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://graph.microsoft.com"
                         }
                       }
                     },
-                    "Prepare_final_roles": {
+                    "Check_role_mapping_mode": {
                       "runAfter": {
-                        "Create_role_objects": [
+                        "Get_user_groups": [
+                          "Succeeded"
+                        ]
+                      },
+                      "type": "If",
+                      "expression": {
+                        "and": [
+                          {
+                            "equals": [
+                              "@parameters('mappingMode')",
+                              "mapped"
+                            ]
+                          }
+                        ]
+                      },
+                      "actions": {
+                        "Map_department_role": {
+                          "runAfter": {},
+                          "type": "Compose",
+                          "inputs": "@coalesce(body('Parse_role_mapping')?['departmentMapping']?[items('For_each_changed_user')?['department']], body('Parse_role_mapping')?['departmentMapping']?['_default'])"
+                        },
+                        "Map_group_roles": {
+                          "runAfter": {
+                            "Map_department_role": [
+                              "Succeeded"
+                            ]
+                          },
+                          "type": "Select",
+                          "inputs": {
+                            "from": "@body('Get_user_groups')?['value']",
+                            "select": "@coalesce(body('Parse_role_mapping')?['groupMapping']?[item()?['displayName']], body('Parse_role_mapping')?['groupMapping']?['_default'])"
+                          }
+                        },
+                        "Combine_mapped_roles": {
+                          "runAfter": {
+                            "Map_group_roles": [
+                              "Succeeded"
+                            ]
+                          },
+                          "type": "Compose",
+                          "inputs": "@union(if(not(equals(outputs('Map_department_role'), null)), createArray(outputs('Map_department_role')), createArray()), body('Map_group_roles'))"
+                        }
+                      },
+                      "else": {
+                        "actions": {
+                          "Get_department_role": {
+                            "runAfter": {},
+                            "type": "Compose",
+                            "inputs": "@items('For_each_changed_user')?['department']"
+                          },
+                          "Get_group_role_names": {
+                            "runAfter": {
+                              "Get_department_role": [
+                                "Succeeded"
+                              ]
+                            },
+                            "type": "Select",
+                            "inputs": {
+                              "from": "@body('Get_user_groups')?['value']",
+                              "select": "@item()?['displayName']"
+                            }
+                          },
+                          "Combine_dynamic_roles": {
+                            "runAfter": {
+                              "Get_group_role_names": [
+                                "Succeeded"
+                              ]
+                            },
+                            "type": "Compose",
+                            "inputs": "@union(if(not(equals(outputs('Get_department_role'), null)), createArray(outputs('Get_department_role')), createArray()), body('Get_group_role_names'))"
+                          }
+                        }
+                      }
+                    },
+                    "Determine_all_roles": {
+                      "runAfter": {
+                        "Check_role_mapping_mode": [
                           "Succeeded"
                         ]
                       },
                       "type": "Compose",
-                      "inputs": "@if(equals(parameters('updateMode'), 'replace'), body('Create_role_objects'), union(coalesce(outputs('Set_user_variable')?['roles'], createArray()), body('Create_role_objects')))"
+                      "inputs": "@if(equals(parameters('mappingMode'), 'mapped'), outputs('Combine_mapped_roles'), outputs('Combine_dynamic_roles'))"
                     },
-                    "Update_SCIM_user": {
+                    "Filter_null_roles": {
                       "runAfter": {
-                        "Prepare_final_roles": [
+                        "Determine_all_roles": [
                           "Succeeded"
                         ]
                       },
-                      "type": "Http",
+                      "type": "Query",
                       "inputs": {
-                        "method": "PUT",
-                        "uri": "https://api.promapp.com/api/scim/users/@{outputs('Set_user_variable')?['id']}",
-                        "headers": {
-                          "Authorization": "Bearer @{parameters('scimApiKey')}",
-                          "Content-Type": "application/json"
+                        "from": "@outputs('Determine_all_roles')",
+                        "where": "@and(not(equals(item(), null)), not(equals(item(), '')))"
+                      }
+                    },
+                    "Check_if_roles_found": {
+                      "runAfter": {
+                        "Filter_null_roles": [
+                          "Succeeded"
+                        ]
+                      },
+                      "type": "If",
+                      "expression": {
+                        "and": [
+                          {
+                            "greater": [
+                              "@length(body('Filter_null_roles'))",
+                              0
+                            ]
+                          }
+                        ]
+                      },
+                      "actions": {
+                        "Get_SCIM_user": {
+                          "runAfter": {},
+                          "type": "Http",
+                          "inputs": {
+                            "method": "GET",
+                            "uri": "https://api.promapp.com/api/scim/users?filter=userName eq \"@{coalesce(items('For_each_changed_user')?['mail'], items('For_each_changed_user')?['userPrincipalName'])}\"",
+                            "headers": {
+                              "Authorization": "Bearer @{parameters('scimApiKey')}",
+                              "Content-Type": "application/json"
+                            }
+                          }
                         },
-                        "body": {
-                          "userName": "@{outputs('Set_user_variable')?['userName']}",
-                          "name": {
-                            "givenName": "@{outputs('Set_user_variable')?['name']?['givenName']}",
-                            "familyName": "@{outputs('Set_user_variable')?['name']?['familyName']}"
+                        "Parse_SCIM_response": {
+                          "runAfter": {
+                            "Get_SCIM_user": [
+                              "Succeeded"
+                            ]
                           },
-                          "active": "@coalesce(outputs('Set_user_variable')?['active'], true)",
-                          "emails": "@outputs('Set_user_variable')?['emails']",
-                          "roles": "@outputs('Prepare_final_roles')"
+                          "type": "ParseJson",
+                          "inputs": {
+                            "content": "@body('Get_SCIM_user')",
+                            "schema": {
+                              "type": "object",
+                              "properties": {
+                                "Resources": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "id": {
+                                        "type": "string"
+                                      },
+                                      "userName": {
+                                        "type": "string"
+                                      },
+                                      "name": {
+                                        "type": "object",
+                                        "properties": {
+                                          "givenName": {
+                                            "type": "string"
+                                          },
+                                          "familyName": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      },
+                                      "active": {
+                                        "type": "boolean"
+                                      },
+                                      "emails": {
+                                        "type": "array"
+                                      },
+                                      "roles": {
+                                        "type": "array"
+                                      }
+                                    }
+                                  }
+                                },
+                                "totalResults": {
+                                  "type": "integer"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "Check_if_user_exists": {
+                          "runAfter": {
+                            "Parse_SCIM_response": [
+                              "Succeeded"
+                            ]
+                          },
+                          "type": "If",
+                          "expression": {
+                            "and": [
+                              {
+                                "greater": [
+                                  "@body('Parse_SCIM_response')?['totalResults']",
+                                  0
+                                ]
+                              }
+                            ]
+                          },
+                          "actions": {
+                            "Set_user_variable": {
+                              "runAfter": {},
+                              "type": "Compose",
+                              "inputs": "@first(body('Parse_SCIM_response')?['Resources'])"
+                            },
+                            "Create_role_objects": {
+                              "runAfter": {
+                                "Set_user_variable": [
+                                  "Succeeded"
+                                ]
+                              },
+                              "type": "Select",
+                              "inputs": {
+                                "from": "@body('Filter_null_roles')",
+                                "select": {
+                                  "display": "@item()"
+                                }
+                              }
+                            },
+                            "Prepare_final_roles": {
+                              "runAfter": {
+                                "Create_role_objects": [
+                                  "Succeeded"
+                                ]
+                              },
+                              "type": "Compose",
+                              "inputs": "@if(equals(parameters('updateMode'), 'replace'), body('Create_role_objects'), union(coalesce(outputs('Set_user_variable')?['roles'], createArray()), body('Create_role_objects')))"
+                            },
+                            "Update_SCIM_user": {
+                              "runAfter": {
+                                "Prepare_final_roles": [
+                                  "Succeeded"
+                                ]
+                              },
+                              "type": "Http",
+                              "inputs": {
+                                "method": "PUT",
+                                "uri": "https://api.promapp.com/api/scim/users/@{outputs('Set_user_variable')?['id']}",
+                                "headers": {
+                                  "Authorization": "Bearer @{parameters('scimApiKey')}",
+                                  "Content-Type": "application/json"
+                                },
+                                "body": {
+                                  "userName": "@{outputs('Set_user_variable')?['userName']}",
+                                  "name": {
+                                    "givenName": "@{outputs('Set_user_variable')?['name']?['givenName']}",
+                                    "familyName": "@{outputs('Set_user_variable')?['name']?['familyName']}"
+                                  },
+                                  "active": "@coalesce(outputs('Set_user_variable')?['active'], true)",
+                                  "emails": "@outputs('Set_user_variable')?['emails']",
+                                  "roles": "@outputs('Prepare_final_roles')"
+                                }
+                              }
+                            }
+                          },
+                          "else": {
+                            "actions": {}
+                          }
                         }
+                      },
+                      "else": {
+                        "actions": {}
                       }
                     }
                   },
@@ -470,9 +746,6 @@
                     "actions": {}
                   }
                 }
-              },
-              "else": {
-                "actions": {}
               }
             }
           },
@@ -481,11 +754,6 @@
         "parameters": {
           "$connections": {
             "value": {
-              "office365users": {
-                "connectionId": "[resourceId('Microsoft.Web/connections', variables('office365ConnectionName'))]",
-                "connectionName": "[variables('office365ConnectionName')]",
-                "id": "[concat(subscription().id, '/providers/Microsoft.Web/locations/', parameters('location'), '/managedApis/office365users')]"
-              },
               "azureblob": {
                 "connectionId": "[resourceId('Microsoft.Web/connections', variables('azureblobConnectionName'))]",
                 "connectionName": "[variables('azureblobConnectionName')]",
@@ -498,9 +766,13 @@
     }
   ],
   "outputs": {
-    "logicAppUrl": {
+    "logicAppName": {
       "type": "string",
-      "value": "[listCallbackUrl(concat(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '/triggers/When_a_user_is_updated'), '2019-05-01').value]"
+      "value": "[parameters('logicAppName')]"
+    },
+    "managedIdentityPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '2019-05-01', 'full').identity.principalId]"
     }
   }
 }
