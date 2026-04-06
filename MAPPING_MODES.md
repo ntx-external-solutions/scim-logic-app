@@ -4,6 +4,10 @@ This guide explains the two mapping modes available in the Process Manager SCIM 
 
 Both **Department Sync** and **Group Sync** workflows support these mapping modes.
 
+> **Important — preventing AD groups from creating new roles in Process Manager**
+>
+> If your concern is that every AD group a user belongs to gets pushed into Process Manager as a new role (causing role bloat), enable the **Role Filter** feature described in [Filtering to Existing Process Manager Roles](#filtering-to-existing-process-manager-roles). With the filter enabled, only departments/groups whose names already exist as roles in Process Manager are synced. This works in **both** dynamic and mapped mode, and dynamic mode + filter is the recommended combination for this use case.
+
 ## Quick Comparison
 
 | Feature | Dynamic Mode | Mapped Mode |
@@ -185,6 +189,113 @@ In this example:
 - **Group Mapping:** "PM-Editors" maps to "Process Editor"
 - Any unmapped department or group gets "Standard User"
 
+## Filtering to Existing Process Manager Roles
+
+By default, the Logic App sends every department and group name (dynamic mode) or every mapped role name (mapped mode) to Process Manager via SCIM. Because the SCIM `PUT` implicitly creates roles that don't exist yet, this can cause unwanted role proliferation — every AD group a user belongs to becomes a new role in Process Manager.
+
+The **role filter** feature solves this by fetching the current list of roles from Process Manager at the start of each run and only syncing departments/groups whose names already exist there. Everything else is silently dropped.
+
+### Recommended: Dynamic Mode + Role Filter
+
+For the "keep Entra ID and Process Manager in sync without creating new roles" use case, the recommended configuration is:
+
+- `mappingMode: dynamic`
+- `filterToExistingRoles: true`
+- Provide `processManagerSiteUrl`, `processManagerUsername`, `processManagerPassword`
+
+**Flow:**
+```
+Entra ID user: Department = "IT-Service-Desk", member of 12 AD groups
+       ↓
+Logic App fetches list of roles from Process Manager:
+  ["Account Manager", "CEO", "Finance", "IT-Service-Desk", "Sales", ...]
+       ↓
+Filter user's department + groups against the list:
+  Kept:    "IT-Service-Desk" (matches)
+  Dropped: 11 AD groups that don't exist as roles in PM
+       ↓
+Process Manager: user is assigned "IT-Service-Desk" only
+```
+
+The user's other 11 AD groups are never pushed to Process Manager, so no new roles are created.
+
+### How It Works
+
+When `filterToExistingRoles` is `true` AND `processManagerSiteUrl` is non-empty, every run of the Logic App:
+
+1. **Fetches an OAuth token** — `POST {processManagerSiteUrl}/oauth2/token` with `grant_type=password` using the provided username/password. Returns a short-lived bearer token.
+2. **Fetches the roles HTML** — `GET {processManagerSiteUrl}/Lookup/AssociateRoles.aspx` with the bearer token. Returns an HTML document containing all existing Process Manager roles.
+3. **Parses role names** — extracts each role label, decodes common HTML entities (`&amp; &#39; &quot; &nbsp; &#246;`), trims, and lowercases them. Stored in the `validRolesLower` variable for the run.
+4. **Filters during mapping:**
+   - **Dynamic mode** — department and each group's displayName are dropped unless their lowercased/trimmed value appears in `validRolesLower`.
+   - **Mapped mode** — the *mapped output* (e.g. the value from `departmentMapping["Eng"]`, or the `_default`) is dropped unless it exists in `validRolesLower`. This means mapped mode also won't create new PM roles via the `_default` fallback.
+5. **Matching is case-insensitive and whitespace-trimmed.** "IT-Service-Desk", "it-service-desk", and " IT-Service-Desk " all match the same PM role.
+
+### Configuration
+
+**Deployment parameters:**
+
+```json
+{
+  "mappingMode":           { "value": "dynamic" },
+  "filterToExistingRoles": { "value": true },
+  "processManagerSiteUrl":  { "value": "https://{tenant}.promapp.com/{tenantId}" },
+  "processManagerUsername": { "value": "svc-scim-sync@example.com" },
+  "processManagerPassword": { "value": "..." }
+}
+```
+
+**Notes:**
+- `processManagerSiteUrl` has **no trailing slash**. The Logic App appends `/oauth2/token` and `/Lookup/AssociateRoles.aspx`.
+- `processManagerUsername` / `processManagerPassword` should belong to a **dedicated service account** in Process Manager, not a real user. The account needs permission to view the roles list.
+- `processManagerPassword` is an ARM `securestring` — encrypted in deployment history, but readable by anyone with read access to the Logic App definition at runtime. For production, reference an Azure Key Vault secret in your parameters file instead of inlining the password.
+- If `filterToExistingRoles` is `false` (the default) or `processManagerSiteUrl` is empty, the fetch is skipped and behavior is unchanged (everything passes through).
+
+### Behavior When the Fetch Fails
+
+- **Token request fails** (bad credentials, locked account, MFA enforced) — the Logic App run fails at the `Get_PM_oauth_token` action. No users are synced until the credentials are fixed. This is deliberately noisy so that stale/broken credentials don't silently allow role bloat.
+- **Roles HTML fetch fails** (Process Manager down, network error, unauthorized) — same: the run fails.
+- **HTML parse returns zero roles** — `validRolesLower` is empty, and the filter expressions treat an empty list as "no filter" and pass everything through. This is a safety fallback but also a **silent failure mode** you should monitor for. If the Nintex team ever changes the HTML structure of the roles page, filtering will stop working without error. See [Monitoring the Filter](#monitoring-the-filter) below.
+
+### Dynamic Mode vs. Mapped Mode With the Filter On
+
+| | Dynamic + Filter | Mapped + Filter |
+|---|---|---|
+| **What gets synced** | Any AD group/department whose name exactly matches a PM role name (case-insensitive, trimmed) | Any AD group/department that maps (via `role-mapping.json`) to a name that exists in PM |
+| **New roles in PM** | Never | Never — even the `_default` fallback is dropped if it doesn't exist |
+| **Best for** | Simple 1:1 name alignment between Entra ID and PM | Naming mismatches you can't fix, or consolidating multiple AD groups to one PM role |
+| **Maintenance** | None | Update `role-mapping.json` when either side changes |
+| **Extra API calls per run** | 2 (OAuth token + roles HTML) | 3 (OAuth token + roles HTML + blob storage read) |
+
+Both combinations solve the "don't create new roles" concern. Pick dynamic unless you have a concrete mapping reason to use mapped.
+
+### Monitoring the Filter
+
+The filter relies on parsing an undocumented HTML endpoint (`/Lookup/AssociateRoles.aspx`), which is designed for Process Manager's UI — not as a public API. If Nintex changes attribute order or HTML structure, the parser may start returning zero roles, at which point the filter silently becomes a no-op.
+
+**Recommended safeguards:**
+1. After a Logic App run, inspect the `Set_valid_roles_lower` action's output and confirm `validRolesLower` has a reasonable count of roles (e.g. dozens or hundreds).
+2. Set an Azure Monitor alert for Logic App runs where `Set_valid_roles_lower` output length is below a threshold (e.g. `< 10`).
+3. If Nintex ever publishes a proper JSON roles API, switch to it — the current HTML parser is fragile by design.
+
+### Limitations and Caveats
+
+1. **Password-grant OAuth flow.** The Logic App uses `grant_type=password` because that's what Process Manager's token endpoint supports. This is considered legacy by modern OAuth specs. If the service account has MFA enforced, the flow will fail outright.
+2. **Service account lockout risk.** If the password is wrong, every polling run (every few minutes) will hit the token endpoint with bad credentials. Depending on your tenant's lockout policy, this could lock the account. Rotate passwords during a maintenance window.
+3. **Limited HTML entity decoding.** Only `&amp;`, `&#39;`, `&quot;`, `&nbsp;`, and `&#246;` are decoded. PM role names containing other numeric or named entities (e.g. `&#241;` for `ñ`) will fail to match. Extend the decode chain in the workflow's `Extract_PM_role_names` Select action if your roles use additional entities.
+4. **No normalization beyond `trim()` and `toLower()`.** Multiple internal spaces, curly quotes, em-dashes vs. hyphens, zero-width characters, etc. are *not* normalized. If you hit a mismatch, the fix is either renaming in one of the two systems or extending the normalization chain.
+5. **Extra tokens per run.** In `azuredeploy.json` (delta polling), one token is fetched per polling interval. In `azuredeploy-separate.json` (webhooks), one token is fetched per user update or group change event. High-volume tenants may want to consider caching, which is not implemented today.
+
+### Troubleshooting the Filter
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| Logic App fails at `Get_PM_oauth_token` with 400/401 | Wrong username, password, or site URL | Verify credentials directly with `curl` against `{siteUrl}/oauth2/token` |
+| Logic App fails at `Get_PM_roles_html` with 401 | Token not accepted — service account may lack permission | Log into Process Manager as the service account and confirm they can view the roles list |
+| User is synced but expected role isn't assigned | The AD group/department name doesn't exist as a role in PM (or matches after normalization) | Inspect `Set_valid_roles_lower` output and look for the expected role (lowercased/trimmed) |
+| *No* users are being synced anymore | `validRolesLower` might be returning empty due to HTML structure change | Inspect `Set_valid_roles_lower` output; if empty, the parser is broken and you may need to extend `Extract_PM_role_names` |
+| Service account keeps getting locked | Password wrong and polling runs hammer the token endpoint | Temporarily set `filterToExistingRoles: false`, fix credentials, re-enable |
+
 ## Migration Between Modes
 
 You can switch between modes by redeploying the Logic App with a different `mappingMode` parameter.
@@ -218,10 +329,15 @@ You can switch between modes by redeploying the Logic App with a different `mapp
 Use this flowchart to choose the right mode:
 
 ```
-Do your department names in Entra ID exactly match role names in Process Manager?
+Do you want to prevent AD groups/departments from creating NEW roles in Process Manager?
+├─ Yes → Enable filterToExistingRoles (see "Filtering to Existing Process Manager Roles")
+│        Then pick dynamic or mapped below.
+└─ No  → Leave filterToExistingRoles = false.
+
+Do your department/group names in Entra ID exactly match role names in Process Manager?
 ├─ Yes → Use Dynamic Mode
 └─ No
-   ├─ Can you rename departments in Entra ID to match?
+   ├─ Can you rename departments/groups in Entra ID to match?
    │  ├─ Yes → Rename and use Dynamic Mode
    │  └─ No → Use Mapped Mode
    └─ Or: Can you rename roles in Process Manager to match?
@@ -360,12 +476,13 @@ For most organizations, the performance difference is negligible.
 ## Recommendations
 
 1. **Start with Dynamic Mode** if possible - it's simpler and easier to maintain
-2. **Use Mapped Mode** when:
+2. **Enable `filterToExistingRoles`** if you don't want AD groups/departments to create new roles in Process Manager. This is the recommended combination for most customers: **Dynamic Mode + Role Filter**.
+3. **Use Mapped Mode** when:
    - You have legacy department naming in Entra ID that can't be changed
    - You need to consolidate multiple departments to one role
    - You want a default fallback role
-3. **Plan for the future**: Consider standardizing names to eventually move to Dynamic Mode
-4. **Test both**: Deploy in a test environment to see which works better for your organization
+4. **Plan for the future**: Consider standardizing names to eventually move to Dynamic Mode
+5. **Test both**: Deploy in a test environment to see which works better for your organization
 
 ## Getting Help
 

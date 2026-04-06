@@ -22,6 +22,18 @@
     },
     "pollingIntervalMinutes": {
       "value": 5
+    },
+    "filterToExistingRoles": {
+      "value": false
+    },
+    "processManagerSiteUrl": {
+      "value": ""
+    },
+    "processManagerUsername": {
+      "value": ""
+    },
+    "processManagerPassword": {
+      "value": ""
     }
   }
 }

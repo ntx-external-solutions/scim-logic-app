@@ -121,12 +121,39 @@ Create a file `logic-app/azuredeploy.parameters.local.json` (this file is gitign
     },
     "mappingMode": {
       "value": "dynamic"
+    },
+    "filterToExistingRoles": {
+      "value": false
+    },
+    "processManagerSiteUrl": {
+      "value": ""
+    },
+    "processManagerUsername": {
+      "value": ""
+    },
+    "processManagerPassword": {
+      "value": ""
     }
   }
 }
 ```
 
 Replace the values with your actual configuration.
+
+**About the role filter parameters** (`filterToExistingRoles`, `processManagerSiteUrl`, `processManagerUsername`, `processManagerPassword`):
+
+Leave these at their defaults (`filterToExistingRoles: false`, the rest empty) for standard behavior. Set `filterToExistingRoles: true` and provide the three Process Manager credentials if you want the Logic App to filter user groups/departments so only those that already exist as roles in Process Manager are synced. See [MAPPING_MODES.md](./MAPPING_MODES.md#filtering-to-existing-process-manager-roles) for details.
+
+**Security note:** `processManagerPassword` is a `securestring`. For production, reference an Azure Key Vault secret in your parameters file instead of inlining the password:
+
+```json
+"processManagerPassword": {
+  "reference": {
+    "keyVault": { "id": "/subscriptions/.../Microsoft.KeyVault/vaults/YOUR_VAULT" },
+    "secretName": "pm-scim-service-account-password"
+  }
+}
+```
 
 #### Step 6: Deploy Logic Apps
 
@@ -254,9 +281,15 @@ az deployment group create \
 
 **Roles not updating:**
 - Check Logic App run history for errors
-- Verify role names match exactly (case-sensitive)
+- Verify role names match exactly (case-sensitive, unless `filterToExistingRoles` is on — then case-insensitive with trim)
 - For mapped mode: Check role-mapping.json is uploaded correctly
 - Verify user exists in both Entra ID and Process Manager
+- If `filterToExistingRoles: true`: inspect the `Set_valid_roles_lower` action output to confirm the filter is populating `validRolesLower` with a sensible list of PM roles
+
+**Role filter (`filterToExistingRoles: true`) errors:**
+- `Get_PM_oauth_token` 400/401: wrong service-account credentials, site URL, or MFA is enforced on the account
+- `Get_PM_roles_html` 401: token issued but service account lacks permission to view the roles list
+- Filter silently no-ops: check that `validRolesLower` is non-empty in the run output; if empty, the HTML parser may need updating
 
 **Deployment failures:**
 - Check Azure CLI is authenticated: `az account show`

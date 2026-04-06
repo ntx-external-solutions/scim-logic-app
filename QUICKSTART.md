@@ -10,6 +10,7 @@ Before starting, gather:
 2. **Process Manager SCIM API Key**
    Find it in Process Manager: Admin → SCIM → API Key
 3. **Entra ID admin access** to authorize API connections
+4. *(Optional — only if enabling the role filter)* **Process Manager service-account credentials**: site URL (e.g. `https://{tenant}.promapp.com/{tenantId}`), username, and password. Used to fetch the list of existing roles so the Logic App doesn't create new ones from AD groups. See [MAPPING_MODES.md](./MAPPING_MODES.md#filtering-to-existing-process-manager-roles).
 
 ## Installation
 
@@ -93,6 +94,14 @@ Should return `"Enabled"`
 2. **Check Process Manager**:
    - The user should now have a role matching the group name
    - If using mapped mode, the role will be the mapped value from role-mapping.json
+
+## Preventing Role Bloat (Optional)
+
+By default, every Entra ID department and group that a user belongs to gets synced to Process Manager as a role. If a role with that name doesn't exist in PM yet, the SCIM API creates it — which can quickly pollute Process Manager with every AD group name.
+
+To prevent this, set `filterToExistingRoles: true` and provide your Process Manager service-account credentials (site URL, username, password). The Logic App will then fetch the current list of PM roles at the start of each run and only sync departments/groups whose names already exist there.
+
+**Recommended combination:** `mappingMode: dynamic` + `filterToExistingRoles: true`. See [MAPPING_MODES.md](./MAPPING_MODES.md#filtering-to-existing-process-manager-roles) for full details.
 
 ## Configuration Modes
 

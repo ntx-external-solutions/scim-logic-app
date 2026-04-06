@@ -19,8 +19,15 @@ cleanup() {
     fi
     unset SCIM_API_KEY
     unset STORAGE_KEY
+    unset PM_PASSWORD
 }
 trap cleanup EXIT
+
+# JSON string escaping for shell-sourced values that go into the parameters file.
+# Escapes backslashes and double-quotes. Does NOT handle control characters.
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
 
 # Input validation: alphanumeric and hyphens only
 validate_resource_name() {
@@ -121,6 +128,50 @@ if [ "$POLLING_INTERVAL" -lt 1 ] || [ "$POLLING_INTERVAL" -gt 60 ]; then
 fi
 
 echo ""
+echo -e "${YELLOW}Role Filter (optional):${NC}"
+echo "  Prevents AD groups/departments from creating new roles in Process Manager."
+echo "  When enabled, only departments/groups whose names already exist as roles"
+echo "  in Process Manager will be synced. Recommended for most customers."
+read -p "Enable role filter? (y/n) [n]: " ENABLE_FILTER
+ENABLE_FILTER=${ENABLE_FILTER:-n}
+
+FILTER_TO_EXISTING_ROLES="false"
+PM_SITE_URL=""
+PM_USERNAME=""
+PM_PASSWORD=""
+
+if [ "$ENABLE_FILTER" = "y" ] || [ "$ENABLE_FILTER" = "Y" ]; then
+    FILTER_TO_EXISTING_ROLES="true"
+    echo ""
+    echo -e "${YELLOW}Process Manager credentials required for the role filter.${NC}"
+    echo "  Use a dedicated service account without MFA."
+    read -p "Process Manager site URL (e.g. https://demo.promapp.com/{tenantId}, no trailing slash): " PM_SITE_URL
+    if [ -z "$PM_SITE_URL" ]; then
+        echo -e "${RED}✗ Process Manager site URL is required when role filter is enabled${NC}"
+        exit 1
+    fi
+    if echo "$PM_SITE_URL" | grep -qE '/$'; then
+        echo -e "${RED}✗ Process Manager site URL must not have a trailing slash${NC}"
+        exit 1
+    fi
+    if ! echo "$PM_SITE_URL" | grep -qE '^https://'; then
+        echo -e "${RED}✗ Process Manager site URL must start with https://${NC}"
+        exit 1
+    fi
+    read -p "Process Manager service-account username: " PM_USERNAME
+    if [ -z "$PM_USERNAME" ]; then
+        echo -e "${RED}✗ Process Manager username is required when role filter is enabled${NC}"
+        exit 1
+    fi
+    read -sp "Process Manager service-account password: " PM_PASSWORD
+    echo ""
+    if [ -z "$PM_PASSWORD" ]; then
+        echo -e "${RED}✗ Process Manager password is required when role filter is enabled${NC}"
+        exit 1
+    fi
+fi
+
+echo ""
 echo -e "${GREEN}Configuration Summary:${NC}"
 echo "  Resource Group: $RESOURCE_GROUP"
 echo "  Location: $LOCATION"
@@ -130,6 +181,12 @@ echo "  Container: $CONTAINER_NAME"
 echo "  Update Mode: $UPDATE_MODE"
 echo "  Mapping Mode: $MAPPING_MODE"
 echo "  Polling Interval: ${POLLING_INTERVAL} minutes"
+echo "  Role Filter: $FILTER_TO_EXISTING_ROLES"
+if [ "$FILTER_TO_EXISTING_ROLES" = "true" ]; then
+    echo "  PM Site URL: $PM_SITE_URL"
+    echo "  PM Username: $PM_USERNAME"
+    echo "  PM Password: (hidden)"
+fi
 echo ""
 
 read -p "Proceed with deployment? (y/n): " CONFIRM
@@ -214,6 +271,13 @@ fi
 echo -e "${YELLOW}[5/6]${NC} Generating deployment parameters..."
 umask 077
 PARAMS_FILE=$(mktemp "${TMPDIR:-/tmp}/azuredeploy.parameters.XXXXXX.json")
+
+# Escape values that may contain backslashes or double quotes
+SCIM_API_KEY_ESC=$(json_escape "$SCIM_API_KEY")
+PM_SITE_URL_ESC=$(json_escape "$PM_SITE_URL")
+PM_USERNAME_ESC=$(json_escape "$PM_USERNAME")
+PM_PASSWORD_ESC=$(json_escape "$PM_PASSWORD")
+
 cat > "$PARAMS_FILE" <<EOF
 {
   "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
@@ -223,7 +287,7 @@ cat > "$PARAMS_FILE" <<EOF
       "value": "$LOGIC_APP_NAME"
     },
     "scimApiKey": {
-      "value": "$SCIM_API_KEY"
+      "value": "$SCIM_API_KEY_ESC"
     },
     "roleMappingStorageAccountName": {
       "value": "$STORAGE_ACCOUNT"
@@ -239,10 +303,23 @@ cat > "$PARAMS_FILE" <<EOF
     },
     "pollingIntervalMinutes": {
       "value": $POLLING_INTERVAL
+    },
+    "filterToExistingRoles": {
+      "value": $FILTER_TO_EXISTING_ROLES
+    },
+    "processManagerSiteUrl": {
+      "value": "$PM_SITE_URL_ESC"
+    },
+    "processManagerUsername": {
+      "value": "$PM_USERNAME_ESC"
+    },
+    "processManagerPassword": {
+      "value": "$PM_PASSWORD_ESC"
     }
   }
 }
 EOF
+unset SCIM_API_KEY_ESC PM_PASSWORD_ESC
 echo -e "${GREEN}  ✓ Parameters file created${NC}"
 
 # Step 6: Deploy Logic App

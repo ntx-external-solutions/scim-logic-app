@@ -56,6 +56,34 @@
       "metadata": {
         "description": "Mapping mode: dynamic (use department name as-is) or mapped (use role-mapping.json)"
       }
+    },
+    "filterToExistingRoles": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "If true, user groups/departments are filtered so only those that already exist as roles in Process Manager are synced. Prevents AD groups from creating new roles in PM. Requires processManagerSiteUrl, processManagerUsername, processManagerPassword."
+      }
+    },
+    "processManagerSiteUrl": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Process Manager tenant base URL, e.g. https://demo.promapp.com/{tenantId}. Used to fetch an OAuth token and the roles list. No trailing slash."
+      }
+    },
+    "processManagerUsername": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Process Manager service-account username used for the OAuth password-grant token request."
+      }
+    },
+    "processManagerPassword": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Process Manager service-account password used for the OAuth password-grant token request."
+      }
     }
   },
   "variables": {
@@ -121,6 +149,22 @@
             "mappingMode": {
               "defaultValue": "[parameters('mappingMode')]",
               "type": "String"
+            },
+            "filterToExistingRoles": {
+              "defaultValue": "[parameters('filterToExistingRoles')]",
+              "type": "Bool"
+            },
+            "processManagerSiteUrl": {
+              "defaultValue": "[parameters('processManagerSiteUrl')]",
+              "type": "String"
+            },
+            "processManagerUsername": {
+              "defaultValue": "[parameters('processManagerUsername')]",
+              "type": "String"
+            },
+            "processManagerPassword": {
+              "defaultValue": "[parameters('processManagerPassword')]",
+              "type": "SecureString"
             }
           },
           "triggers": {
@@ -144,8 +188,25 @@
             }
           },
           "actions": {
-            "Get_user_profile": {
+            "Initialize_valid_roles_lower": {
               "runAfter": {},
+              "type": "InitializeVariable",
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "validRolesLower",
+                    "type": "array",
+                    "value": []
+                  }
+                ]
+              }
+            },
+            "Get_user_profile": {
+              "runAfter": {
+                "Initialize_valid_roles_lower": [
+                  "Succeeded"
+                ]
+              },
               "type": "ApiConnection",
               "inputs": {
                 "host": {
@@ -157,9 +218,100 @@
                 "path": "/users/@{encodeURIComponent(triggerBody()?['userId'])}"
               }
             },
-            "Check_mapping_mode": {
+            "Fetch_existing_PM_roles": {
               "runAfter": {
                 "Get_user_profile": [
+                  "Succeeded"
+                ]
+              },
+              "type": "If",
+              "expression": {
+                "and": [
+                  {
+                    "equals": [
+                      "@parameters('filterToExistingRoles')",
+                      true
+                    ]
+                  },
+                  {
+                    "not": {
+                      "equals": [
+                        "@parameters('processManagerSiteUrl')",
+                        ""
+                      ]
+                    }
+                  }
+                ]
+              },
+              "actions": {
+                "Get_PM_oauth_token": {
+                  "runAfter": {},
+                  "type": "Http",
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "@{parameters('processManagerSiteUrl')}/oauth2/token",
+                    "headers": {
+                      "Content-Type": "application/x-www-form-urlencoded"
+                    },
+                    "body": "grant_type=password&username=@{encodeUriComponent(parameters('processManagerUsername'))}&password=@{encodeUriComponent(parameters('processManagerPassword'))}&duration=3600000"
+                  }
+                },
+                "Get_PM_roles_html": {
+                  "runAfter": {
+                    "Get_PM_oauth_token": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@{parameters('processManagerSiteUrl')}/Lookup/AssociateRoles.aspx",
+                    "headers": {
+                      "Authorization": "Bearer @{body('Get_PM_oauth_token')?['access_token']}"
+                    }
+                  }
+                },
+                "Split_PM_roles_html": {
+                  "runAfter": {
+                    "Get_PM_roles_html": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "Compose",
+                  "inputs": "@skip(split(string(body('Get_PM_roles_html')), 'checkbox-label\" for=\"R'), 1)"
+                },
+                "Extract_PM_role_names": {
+                  "runAfter": {
+                    "Split_PM_roles_html": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "Select",
+                  "inputs": {
+                    "from": "@outputs('Split_PM_roles_html')",
+                    "select": "@toLower(trim(replace(replace(replace(replace(replace(first(split(substring(item(), add(indexOf(item(), '>'), 1)), '</label>')), '&amp;', '&'), '&#39;', ''''), '&quot;', '\"'), '&nbsp;', ' '), '&#246;', 'ö')))"
+                  }
+                },
+                "Set_valid_roles_lower": {
+                  "runAfter": {
+                    "Extract_PM_role_names": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "validRolesLower",
+                    "value": "@body('Extract_PM_role_names')"
+                  }
+                }
+              },
+              "else": {
+                "actions": {}
+              }
+            },
+            "Check_mapping_mode": {
+              "runAfter": {
+                "Fetch_existing_PM_roles": [
                   "Succeeded"
                 ]
               },
@@ -217,7 +369,7 @@
                     ]
                   },
                   "type": "Compose",
-                  "inputs": "@coalesce(body('Parse_role_mapping')?['departmentMapping']?[body('Get_user_profile')?['Department']], body('Parse_role_mapping')?['departmentMapping']?['_default'])"
+                  "inputs": "@if(or(empty(variables('validRolesLower')), contains(variables('validRolesLower'), toLower(trim(coalesce(coalesce(body('Parse_role_mapping')?['departmentMapping']?[body('Get_user_profile')?['Department']], body('Parse_role_mapping')?['departmentMapping']?['_default']), ''))))), coalesce(body('Parse_role_mapping')?['departmentMapping']?[body('Get_user_profile')?['Department']], body('Parse_role_mapping')?['departmentMapping']?['_default']), null)"
                 }
               },
               "else": {
@@ -225,7 +377,7 @@
                   "Set_dynamic_role": {
                     "runAfter": {},
                     "type": "Compose",
-                    "inputs": "@body('Get_user_profile')?['Department']"
+                    "inputs": "@if(or(empty(variables('validRolesLower')), contains(variables('validRolesLower'), toLower(trim(coalesce(body('Get_user_profile')?['Department'], ''))))), body('Get_user_profile')?['Department'], null)"
                   }
                 }
               }
@@ -474,6 +626,22 @@
             "mappingMode": {
               "defaultValue": "[parameters('mappingMode')]",
               "type": "String"
+            },
+            "filterToExistingRoles": {
+              "defaultValue": "[parameters('filterToExistingRoles')]",
+              "type": "Bool"
+            },
+            "processManagerSiteUrl": {
+              "defaultValue": "[parameters('processManagerSiteUrl')]",
+              "type": "String"
+            },
+            "processManagerUsername": {
+              "defaultValue": "[parameters('processManagerUsername')]",
+              "type": "String"
+            },
+            "processManagerPassword": {
+              "defaultValue": "[parameters('processManagerPassword')]",
+              "type": "SecureString"
             }
           },
           "triggers": {
@@ -497,8 +665,25 @@
             }
           },
           "actions": {
-            "Get_group_details": {
+            "Initialize_valid_roles_lower": {
               "runAfter": {},
+              "type": "InitializeVariable",
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "validRolesLower",
+                    "type": "array",
+                    "value": []
+                  }
+                ]
+              }
+            },
+            "Get_group_details": {
+              "runAfter": {
+                "Initialize_valid_roles_lower": [
+                  "Succeeded"
+                ]
+              },
               "type": "ApiConnection",
               "inputs": {
                 "host": {
@@ -525,6 +710,97 @@
                 },
                 "method": "get",
                 "path": "/groups/@{encodeURIComponent(triggerBody()?['resourceData']?['id'])}/members"
+              }
+            },
+            "Fetch_existing_PM_roles": {
+              "runAfter": {
+                "Get_group_members": [
+                  "Succeeded"
+                ]
+              },
+              "type": "If",
+              "expression": {
+                "and": [
+                  {
+                    "equals": [
+                      "@parameters('filterToExistingRoles')",
+                      true
+                    ]
+                  },
+                  {
+                    "not": {
+                      "equals": [
+                        "@parameters('processManagerSiteUrl')",
+                        ""
+                      ]
+                    }
+                  }
+                ]
+              },
+              "actions": {
+                "Get_PM_oauth_token": {
+                  "runAfter": {},
+                  "type": "Http",
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "@{parameters('processManagerSiteUrl')}/oauth2/token",
+                    "headers": {
+                      "Content-Type": "application/x-www-form-urlencoded"
+                    },
+                    "body": "grant_type=password&username=@{encodeUriComponent(parameters('processManagerUsername'))}&password=@{encodeUriComponent(parameters('processManagerPassword'))}&duration=3600000"
+                  }
+                },
+                "Get_PM_roles_html": {
+                  "runAfter": {
+                    "Get_PM_oauth_token": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@{parameters('processManagerSiteUrl')}/Lookup/AssociateRoles.aspx",
+                    "headers": {
+                      "Authorization": "Bearer @{body('Get_PM_oauth_token')?['access_token']}"
+                    }
+                  }
+                },
+                "Split_PM_roles_html": {
+                  "runAfter": {
+                    "Get_PM_roles_html": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "Compose",
+                  "inputs": "@skip(split(string(body('Get_PM_roles_html')), 'checkbox-label\" for=\"R'), 1)"
+                },
+                "Extract_PM_role_names": {
+                  "runAfter": {
+                    "Split_PM_roles_html": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "Select",
+                  "inputs": {
+                    "from": "@outputs('Split_PM_roles_html')",
+                    "select": "@toLower(trim(replace(replace(replace(replace(replace(first(split(substring(item(), add(indexOf(item(), '>'), 1)), '</label>')), '&amp;', '&'), '&#39;', ''''), '&quot;', '\"'), '&nbsp;', ' '), '&#246;', 'ö')))"
+                  }
+                },
+                "Set_valid_roles_lower": {
+                  "runAfter": {
+                    "Extract_PM_role_names": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "validRolesLower",
+                    "value": "@body('Extract_PM_role_names')"
+                  }
+                }
+              },
+              "else": {
+                "actions": {}
               }
             },
             "For_each_member": {
@@ -605,17 +881,29 @@
                       "type": "Select",
                       "inputs": {
                         "from": "@body('Get_user_groups')?['value']",
-                        "select": "@coalesce(body('Parse_role_mapping_groups')?['groupMapping']?[item()?['displayName']], body('Parse_role_mapping_groups')?['groupMapping']?['_default'])"
+                        "select": "@if(or(empty(variables('validRolesLower')), contains(variables('validRolesLower'), toLower(trim(coalesce(coalesce(body('Parse_role_mapping_groups')?['groupMapping']?[item()?['displayName']], body('Parse_role_mapping_groups')?['groupMapping']?['_default']), ''))))), coalesce(body('Parse_role_mapping_groups')?['groupMapping']?[item()?['displayName']], body('Parse_role_mapping_groups')?['groupMapping']?['_default']), null)"
                       }
                     }
                   },
                   "else": {
                     "actions": {
-                      "Map_groups_directly": {
+                      "Filter_groups_to_valid_roles": {
                         "runAfter": {},
-                        "type": "Select",
+                        "type": "Query",
                         "inputs": {
                           "from": "@body('Get_user_groups')?['value']",
+                          "where": "@or(empty(variables('validRolesLower')), contains(variables('validRolesLower'), toLower(trim(coalesce(item()?['displayName'], '')))))"
+                        }
+                      },
+                      "Map_groups_directly": {
+                        "runAfter": {
+                          "Filter_groups_to_valid_roles": [
+                            "Succeeded"
+                          ]
+                        },
+                        "type": "Select",
+                        "inputs": {
+                          "from": "@body('Filter_groups_to_valid_roles')",
                           "select": "@item()?['displayName']"
                         }
                       }
@@ -810,7 +1098,7 @@
                 }
               },
               "runAfter": {
-                "Get_group_members": [
+                "Fetch_existing_PM_roles": [
                   "Succeeded"
                 ]
               },

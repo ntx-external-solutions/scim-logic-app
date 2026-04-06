@@ -65,7 +65,8 @@ Update User with All Roles
 - Single unified workflow
 - Combines department and group-based roles
 - Automatic deduplication
-- Configurable mapping modes
+- Configurable mapping modes (dynamic or mapped)
+- Optional **role filter** to prevent AD groups/departments from creating new roles in Process Manager
 - Preserve or replace existing roles
 
 ## Mapping Modes
@@ -99,6 +100,24 @@ Uses a configuration file (`role-mapping.json`) to map department names and grou
 - Entra ID Department: "Eng" → Mapped to Process Manager Role: "Engineering Team"
 - Entra ID Group: "PM-Editors" → Mapped to Process Manager Role: "Process Editor"
 
+### Role Filter (Optional)
+
+Either mode can be combined with the **role filter** (`filterToExistingRoles: true`) to prevent role bloat in Process Manager. When enabled, the Logic App fetches the current list of roles from Process Manager at the start of each run and only syncs departments/groups whose names already exist there.
+
+**Use when:**
+- You don't want every AD group a user belongs to to be created as a new role in Process Manager
+- You want Process Manager to remain the source of truth for which roles exist
+- You need Entra ID → Process Manager sync without Process Manager → Entra ID pollution
+
+**How it works:**
+- The Logic App calls `POST {processManagerSiteUrl}/oauth2/token` with the configured service-account credentials
+- Then `GET {processManagerSiteUrl}/Lookup/AssociateRoles.aspx` to retrieve the HTML list of roles
+- Extracts and normalizes role names, then filters user departments/groups against them (case-insensitive, whitespace-trimmed)
+
+**Recommended combination:** `mappingMode: dynamic` + `filterToExistingRoles: true`.
+
+See [MAPPING_MODES.md](./MAPPING_MODES.md#filtering-to-existing-process-manager-roles) for full details, monitoring guidance, and caveats.
+
 ## Prerequisites
 
 1. **Azure Subscription** with permissions to create:
@@ -115,7 +134,12 @@ Uses a configuration file (`role-mapping.json`) to map department names and grou
    - Valid Bearer token (API key)
    - Roles configured that match your mapping
 
-4. **Azure CLI** or **Azure PowerShell** installed locally
+4. **Process Manager service account** (only if enabling `filterToExistingRoles`):
+   - Dedicated user in Process Manager with permission to view the roles list
+   - Username and password stored in ARM parameters (or ideally Key Vault)
+   - **Not** MFA-enforced — the OAuth password-grant flow doesn't support MFA
+
+5. **Azure CLI** or **Azure PowerShell** installed locally
 
 ## Deployment Steps
 
@@ -194,6 +218,18 @@ Edit `logic-app/azuredeploy.parameters.json`:
     },
     "mappingMode": {
       "value": "dynamic"
+    },
+    "filterToExistingRoles": {
+      "value": false
+    },
+    "processManagerSiteUrl": {
+      "value": ""
+    },
+    "processManagerUsername": {
+      "value": ""
+    },
+    "processManagerPassword": {
+      "value": ""
     }
   }
 }
@@ -208,6 +244,10 @@ Edit `logic-app/azuredeploy.parameters.json`:
 - `updateMode`:
   - `preserve`: Adds the department role while keeping existing roles
   - `replace`: Replaces all roles with only the department role
+- `filterToExistingRoles`: `true` to filter user groups/departments to only those that already exist as roles in Process Manager. Prevents AD groups from creating new roles in PM. Default `false`. See [MAPPING_MODES.md](./MAPPING_MODES.md#filtering-to-existing-process-manager-roles).
+- `processManagerSiteUrl`: Process Manager tenant base URL, e.g. `https://{tenant}.promapp.com/{tenantId}`. **No trailing slash.** Required when `filterToExistingRoles` is `true`.
+- `processManagerUsername`: Process Manager service-account username used for the OAuth password-grant token request. Required when `filterToExistingRoles` is `true`.
+- `processManagerPassword`: Process Manager service-account password (securestring). Required when `filterToExistingRoles` is `true`.
 
 ### Step 4: Deploy the Logic App
 
@@ -383,6 +423,12 @@ az logic workflow run show \
 **Authentication errors:**
 - Verify the SCIM API key is correct and not expired
 - Check that the API key has appropriate permissions
+
+**Role filter errors (`filterToExistingRoles: true`):**
+- **`Get_PM_oauth_token` fails with 400/401**: service-account username/password or site URL is wrong, or the account has MFA enforced (password grant doesn't support MFA). Test `POST {processManagerSiteUrl}/oauth2/token` with `curl` to verify.
+- **`Get_PM_roles_html` fails with 401**: the token was issued but rejected by the roles endpoint — the service account likely lacks permission to view the roles list. Log in as that account in Process Manager and confirm they can see roles.
+- **Filter appears to be a no-op** (all AD groups still being synced): inspect the `Set_valid_roles_lower` action output in the run history. If the array is empty, the HTML parser may be broken. If it has entries but the expected role is missing, the role name in PM probably doesn't match the AD group name after case/whitespace normalization.
+- **Service account keeps getting locked**: wrong credentials cause every polling run to hit the token endpoint. Temporarily set `filterToExistingRoles: false`, fix the credentials, then re-enable.
 
 ## Testing
 
