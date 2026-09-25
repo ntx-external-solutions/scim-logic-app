@@ -1,372 +1,231 @@
 #!/bin/bash
-
-# Azure Logic App Deployment Script
-# Process Manager SCIM Sync
+#
+# Process Manager SCIM Sync - command-line installer.
+# The "Deploy to Azure" button in README.md does the same thing from the Azure Portal.
 
 set -e
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Temp file cleanup trap
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 PARAMS_FILE=""
 cleanup() {
     if [ -n "$PARAMS_FILE" ] && [ -f "$PARAMS_FILE" ]; then
         rm -f "$PARAMS_FILE"
     fi
-    unset SCIM_API_KEY
-    unset STORAGE_KEY
-    unset PM_PASSWORD
+    unset SCIM_API_KEY PM_PASSWORD
 }
 trap cleanup EXIT
 
-# JSON string escaping for shell-sourced values that go into the parameters file.
-# Escapes backslashes and double-quotes. Does NOT handle control characters.
-json_escape() {
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+fail() {
+    echo -e "${RED}✗ $1${NC}"
+    exit 1
 }
 
-# Input validation: alphanumeric and hyphens only
+# Resource names: letters, numbers and hyphens only
 validate_resource_name() {
-    local name="$1"
-    local label="$2"
-    if ! echo "$name" | grep -qE '^[a-zA-Z0-9-]+$'; then
-        echo -e "${RED}✗ ${label} contains invalid characters. Only alphanumeric characters and hyphens are allowed.${NC}"
-        exit 1
-    fi
+    echo "$1" | grep -qE '^[a-zA-Z0-9-]+$' || fail "$2 can only contain letters, numbers and hyphens."
 }
 
-echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║   Process Manager SCIM Sync - Azure Deployment Script     ║${NC}"
-echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
+# ask <variable> <prompt> <default> [allowed values...]
+ask() {
+    local var="$1" prompt="$2" default="$3"
+    shift 3
+    local answer
+    read -p "$prompt [$default]: " answer
+    answer="${answer:-$default}"
+    if [ $# -gt 0 ] && ! printf '%s\n' "$@" | grep -qx "$answer"; then
+        fail "Please enter one of: $*"
+    fi
+    printf -v "$var" '%s' "$answer"
+}
+
+echo -e "${GREEN}Process Manager SCIM Sync - Azure installer${NC}"
 echo ""
 
-# Check if Azure CLI is installed
-if ! command -v az &> /dev/null; then
-    echo -e "${RED}✗ Azure CLI is not installed. Please install it first:${NC}"
-    echo "  https://docs.microsoft.com/en-us/cli/azure/install-azure-cli"
-    exit 1
-fi
-
-# Check if user is logged in
+command -v az &> /dev/null || fail "Azure CLI is not installed: https://learn.microsoft.com/cli/azure/install-azure-cli"
 if ! az account show &> /dev/null; then
-    echo -e "${YELLOW}⚠ You are not logged into Azure. Please log in:${NC}"
+    echo -e "${YELLOW}Please sign in to Azure:${NC}"
     az login
 fi
-
-echo -e "${GREEN}✓ Azure CLI is configured${NC}"
+echo -e "${GREEN}✓ Signed in to Azure as $(az account show --query user.name -o tsv) ($(az account show --query name -o tsv))${NC}"
 echo ""
 
-# Prompt for configuration
-read -p "Enter Resource Group name [rg-processmanager-scim]: " RESOURCE_GROUP
-RESOURCE_GROUP=${RESOURCE_GROUP:-rg-processmanager-scim}
-validate_resource_name "$RESOURCE_GROUP" "Resource Group name"
+# ---------------------------------------------------------------- Azure location
 
-read -p "Enter Azure region [eastus]: " LOCATION
-LOCATION=${LOCATION:-eastus}
+ask RESOURCE_GROUP "Resource group name" "rg-processmanager-scim"
+validate_resource_name "$RESOURCE_GROUP" "Resource group name"
+ask LOCATION "Azure region" "eastus"
 validate_resource_name "$LOCATION" "Azure region"
-
-read -p "Enter Logic App name [ProcessManagerSCIMSync]: " LOGIC_APP_NAME
-LOGIC_APP_NAME=${LOGIC_APP_NAME:-ProcessManagerSCIMSync}
+ask LOGIC_APP_NAME "Logic App name" "ProcessManagerSCIMSync"
 validate_resource_name "$LOGIC_APP_NAME" "Logic App name"
 
 echo ""
-echo -e "${YELLOW}⚠ Storage Account name must be globally unique (3-24 lowercase letters and numbers)${NC}"
-read -p "Enter Storage Account name [pmscimconfig$(date +%s)]: " STORAGE_ACCOUNT
-STORAGE_ACCOUNT=${STORAGE_ACCOUNT:-pmscimconfig$(date +%s)}
-validate_resource_name "$STORAGE_ACCOUNT" "Storage Account name"
+read -sp "Process Manager SCIM API token: " SCIM_API_KEY
+echo ""
+[ -n "$SCIM_API_KEY" ] || fail "The SCIM API token is required."
 
-read -p "Enter Storage Container name [config]: " CONTAINER_NAME
-CONTAINER_NAME=${CONTAINER_NAME:-config}
-validate_resource_name "$CONTAINER_NAME" "Storage Container name"
+# ---------------------------------------------------------------- how roles are chosen
 
 echo ""
-echo -e "${YELLOW}⚠ Your SCIM API key will be stored securely but will be visible to Logic App editors${NC}"
-read -sp "Enter Process Manager SCIM API Key: " SCIM_API_KEY
-echo ""
+echo -e "${YELLOW}What should decide a user's Process Manager roles?${NC}"
+echo "  department - the Department field on their Entra ID profile (one role per user)"
+echo "  groups     - the Entra ID groups they belong to"
+echo "  both       - department and groups together"
+ask ROLE_SOURCE "Role source" "department" department groups both
 
-if [ -z "$SCIM_API_KEY" ]; then
-    echo -e "${RED}✗ SCIM API Key is required${NC}"
-    exit 1
+echo ""
+echo -e "${YELLOW}How should Entra ID names become Process Manager role names?${NC}"
+echo "  dynamic       - use the department/group name as the role name, exactly as-is"
+echo "  mapped        - use config/role-mapping.json to translate names"
+echo "  entraAppRoles - assign roles in the Entra admin center via an Enterprise App (groups/both only)"
+ask MAPPING_MODE "Mapping mode" "dynamic" dynamic mapped entraAppRoles
+
+ENTRA_APP_ID=""
+if [ "$MAPPING_MODE" = "entraAppRoles" ]; then
+    [ "$ROLE_SOURCE" != "department" ] || fail "entraAppRoles needs Role source 'groups' or 'both'."
+    read -p "Application (client) ID of the Enterprise App: " ENTRA_APP_ID
+    echo "$ENTRA_APP_ID" | grep -qE '^[0-9a-fA-F-]{36}$' || fail "That doesn't look like an application ID (a GUID)."
 fi
-
-read -p "Enter update mode (preserve/replace) [preserve]: " UPDATE_MODE
-UPDATE_MODE=${UPDATE_MODE:-preserve}
-
-if [ "$UPDATE_MODE" != "preserve" ] && [ "$UPDATE_MODE" != "replace" ]; then
-    echo -e "${RED}✗ Update mode must be 'preserve' or 'replace'${NC}"
-    exit 1
-fi
-
-echo ""
-echo -e "${YELLOW}Role Mapping Mode:${NC}"
-echo "  - ${GREEN}dynamic${NC}: Use Entra ID department/group names directly as Process Manager roles (1:1 mapping)"
-echo "  - ${GREEN}mapped${NC}: Use role-mapping.json to map departments/groups to roles (flexible mapping)"
-read -p "Enter mapping mode (dynamic/mapped) [dynamic]: " MAPPING_MODE
-MAPPING_MODE=${MAPPING_MODE:-dynamic}
-
-if [ "$MAPPING_MODE" != "dynamic" ] && [ "$MAPPING_MODE" != "mapped" ]; then
-    echo -e "${RED}✗ Mapping mode must be 'dynamic' or 'mapped'${NC}"
-    exit 1
+if [ "$MAPPING_MODE" = "mapped" ] && [ ! -f "$SCRIPT_DIR/config/role-mapping.json" ]; then
+    fail "config/role-mapping.json not found. Create it before choosing mapped mode."
 fi
 
 echo ""
-read -p "Enter polling interval in minutes (1-60) [5]: " POLLING_INTERVAL
-POLLING_INTERVAL=${POLLING_INTERVAL:-5}
-
-if ! echo "$POLLING_INTERVAL" | grep -qE '^[0-9]+$'; then
-    echo -e "${RED}✗ Polling interval must be a number${NC}"
-    exit 1
-fi
-
-if [ "$POLLING_INTERVAL" -lt 1 ] || [ "$POLLING_INTERVAL" -gt 60 ]; then
-    echo -e "${RED}✗ Polling interval must be between 1 and 60 minutes${NC}"
-    exit 1
-fi
+echo -e "${YELLOW}When a user's roles change, what happens to roles they already have?${NC}"
+echo "  managed  - remove only roles this sync gave them; keep roles added by hand (recommended)"
+echo "  preserve - never remove anything, only add"
+echo "  replace  - make their roles exactly match Entra ID"
+ask UPDATE_MODE "Update mode" "managed" managed preserve replace
 
 echo ""
-echo -e "${YELLOW}Role Filter (optional):${NC}"
-echo "  Prevents AD groups/departments from creating new roles in Process Manager."
-echo "  When enabled, only departments/groups whose names already exist as roles"
-echo "  in Process Manager will be synced. Recommended for most customers."
-read -p "Enable role filter? (y/n) [n]: " ENABLE_FILTER
-ENABLE_FILTER=${ENABLE_FILTER:-n}
+ask POLLING_INTERVAL "Check for changes every how many minutes (1-60)" "15"
+echo "$POLLING_INTERVAL" | grep -qE '^[0-9]+$' && [ "$POLLING_INTERVAL" -ge 1 ] && [ "$POLLING_INTERVAL" -le 60 ] \
+    || fail "Enter a number of minutes between 1 and 60."
 
-FILTER_TO_EXISTING_ROLES="false"
+ask SYNC_EXISTING "Update every existing user on the first run? (y/n)" "n" y n Y N
+SYNC_EXISTING_BOOL=false
+[[ "$SYNC_EXISTING" =~ ^[Yy]$ ]] && SYNC_EXISTING_BOOL=true
+
+# ---------------------------------------------------------------- optional role filter
+
+echo ""
+echo -e "${YELLOW}Role filter (optional)${NC}"
+echo "  Only assign roles that already exist in Process Manager, so Entra ID never creates new ones."
+echo "  Needs a Process Manager service account without MFA."
+ask ENABLE_FILTER "Enable role filter? (y/n)" "n" y n Y N
+
+FILTER_TO_EXISTING_ROLES=false
 PM_SITE_URL=""
 PM_USERNAME=""
 PM_PASSWORD=""
-
-if [ "$ENABLE_FILTER" = "y" ] || [ "$ENABLE_FILTER" = "Y" ]; then
-    FILTER_TO_EXISTING_ROLES="true"
+if [[ "$ENABLE_FILTER" =~ ^[Yy]$ ]]; then
+    FILTER_TO_EXISTING_ROLES=true
+    read -p "Process Manager site URL (e.g. https://demo.promapp.com/{tenantId}): " PM_SITE_URL
+    PM_SITE_URL="${PM_SITE_URL%/}"
+    echo "$PM_SITE_URL" | grep -qE '^https://' || fail "The site URL must start with https://"
+    read -p "Service-account username: " PM_USERNAME
+    [ -n "$PM_USERNAME" ] || fail "Username is required for the role filter."
+    read -sp "Service-account password: " PM_PASSWORD
     echo ""
-    echo -e "${YELLOW}Process Manager credentials required for the role filter.${NC}"
-    echo "  Use a dedicated service account without MFA."
-    read -p "Process Manager site URL (e.g. https://demo.promapp.com/{tenantId}, no trailing slash): " PM_SITE_URL
-    if [ -z "$PM_SITE_URL" ]; then
-        echo -e "${RED}✗ Process Manager site URL is required when role filter is enabled${NC}"
-        exit 1
-    fi
-    if echo "$PM_SITE_URL" | grep -qE '/$'; then
-        echo -e "${RED}✗ Process Manager site URL must not have a trailing slash${NC}"
-        exit 1
-    fi
-    if ! echo "$PM_SITE_URL" | grep -qE '^https://'; then
-        echo -e "${RED}✗ Process Manager site URL must start with https://${NC}"
-        exit 1
-    fi
-    read -p "Process Manager service-account username: " PM_USERNAME
-    if [ -z "$PM_USERNAME" ]; then
-        echo -e "${RED}✗ Process Manager username is required when role filter is enabled${NC}"
-        exit 1
-    fi
-    read -sp "Process Manager service-account password: " PM_PASSWORD
-    echo ""
-    if [ -z "$PM_PASSWORD" ]; then
-        echo -e "${RED}✗ Process Manager password is required when role filter is enabled${NC}"
-        exit 1
-    fi
+    [ -n "$PM_PASSWORD" ] || fail "Password is required for the role filter."
 fi
 
-echo ""
-echo -e "${GREEN}Configuration Summary:${NC}"
-echo "  Resource Group: $RESOURCE_GROUP"
-echo "  Location: $LOCATION"
-echo "  Logic App: $LOGIC_APP_NAME"
-echo "  Storage Account: $STORAGE_ACCOUNT"
-echo "  Container: $CONTAINER_NAME"
-echo "  Update Mode: $UPDATE_MODE"
-echo "  Mapping Mode: $MAPPING_MODE"
-echo "  Polling Interval: ${POLLING_INTERVAL} minutes"
-echo "  Role Filter: $FILTER_TO_EXISTING_ROLES"
-if [ "$FILTER_TO_EXISTING_ROLES" = "true" ]; then
-    echo "  PM Site URL: $PM_SITE_URL"
-    echo "  PM Username: $PM_USERNAME"
-    echo "  PM Password: (hidden)"
-fi
-echo ""
-
-read -p "Proceed with deployment? (y/n): " CONFIRM
-if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
-    echo "Deployment cancelled."
-    exit 0
-fi
+# ---------------------------------------------------------------- confirm
 
 echo ""
-echo -e "${GREEN}Starting deployment...${NC}"
+echo -e "${GREEN}Summary${NC}"
+echo "  Resource group:  $RESOURCE_GROUP ($LOCATION)"
+echo "  Logic App:       $LOGIC_APP_NAME"
+echo "  Role source:     $ROLE_SOURCE"
+echo "  Mapping mode:    $MAPPING_MODE${ENTRA_APP_ID:+ ($ENTRA_APP_ID)}"
+echo "  Update mode:     $UPDATE_MODE"
+echo "  Checks every:    $POLLING_INTERVAL minutes"
+echo "  Sync everyone on first run: $SYNC_EXISTING_BOOL"
+echo "  Role filter:     $FILTER_TO_EXISTING_ROLES"
 echo ""
+ask CONFIRM "Deploy now? (y/n)" "y" y n Y N
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
 
-# Step 1: Create Resource Group
-echo -e "${YELLOW}[1/6]${NC} Creating resource group..."
+# ---------------------------------------------------------------- deploy
+
+echo ""
+echo -e "${YELLOW}[1/4]${NC} Resource group..."
 if az group show --name "$RESOURCE_GROUP" &> /dev/null; then
-    echo -e "${GREEN}  ✓ Resource group already exists${NC}"
+    echo -e "${GREEN}  ✓ Already exists${NC}"
 else
     az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
-    echo -e "${GREEN}  ✓ Resource group created${NC}"
+    echo -e "${GREEN}  ✓ Created${NC}"
 fi
 
-# Step 2: Create Storage Account
-echo -e "${YELLOW}[2/6]${NC} Creating storage account..."
-if az storage account show --name "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" &> /dev/null; then
-    echo -e "${GREEN}  ✓ Storage account already exists${NC}"
-else
-    az storage account create \
-        --name "$STORAGE_ACCOUNT" \
+echo -e "${YELLOW}[2/4]${NC} Deploying Logic App and storage (a few minutes)..."
+umask 077
+PARAMS_FILE=$(mktemp "${TMPDIR:-/tmp}/azuredeploy.parameters.XXXXXX")
+# Values go through python's json module so any character in a password or token is escaped correctly.
+SCIM_API_KEY="$SCIM_API_KEY" PM_SITE_URL="$PM_SITE_URL" PM_USERNAME="$PM_USERNAME" PM_PASSWORD="$PM_PASSWORD" \
+    python3 - "$PARAMS_FILE" <<EOF
+import json, os, sys
+params = {
+    "logicAppName": "$LOGIC_APP_NAME",
+    "scimApiKey": os.environ["SCIM_API_KEY"],
+    "roleSource": "$ROLE_SOURCE",
+    "mappingMode": "$MAPPING_MODE",
+    "entraAppId": "$ENTRA_APP_ID",
+    "updateMode": "$UPDATE_MODE",
+    "pollingIntervalMinutes": $POLLING_INTERVAL,
+    "syncExistingUsersOnFirstRun": $( [ "$SYNC_EXISTING_BOOL" = true ] && echo True || echo False ),
+    "filterToExistingRoles": $( [ "$FILTER_TO_EXISTING_ROLES" = true ] && echo True || echo False ),
+    "processManagerSiteUrl": os.environ["PM_SITE_URL"],
+    "processManagerUsername": os.environ["PM_USERNAME"],
+    "processManagerPassword": os.environ["PM_PASSWORD"],
+}
+with open(sys.argv[1], "w") as f:
+    json.dump({"\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+               "contentVersion": "1.0.0.0",
+               "parameters": {k: {"value": v} for k, v in params.items()}}, f)
+EOF
+
+if ! STORAGE_ACCOUNT=$(az deployment group create \
         --resource-group "$RESOURCE_GROUP" \
-        --location "$LOCATION" \
-        --sku Standard_LRS \
-        --kind StorageV2 \
-        --https-only true \
-        --min-tls-version TLS1_2 \
-        --allow-blob-public-access false \
-        --output none
-    echo -e "${GREEN}  ✓ Storage account created${NC}"
+        --template-file "$SCRIPT_DIR/logic-app/azuredeploy.json" \
+        --parameters "@$PARAMS_FILE" \
+        --query "properties.outputs.storageAccountName.value" -o tsv); then
+    fail "Deployment failed. The error above says why. If it mentions 'roleAssignments', your Azure account needs the Owner or User Access Administrator role on the subscription or resource group."
 fi
+echo -e "${GREEN}  ✓ Deployed (storage account: $STORAGE_ACCOUNT)${NC}"
 
-# Get storage key
-STORAGE_KEY=$(az storage account keys list \
-    --resource-group "$RESOURCE_GROUP" \
-    --account-name "$STORAGE_ACCOUNT" \
-    --query '[0].value' -o tsv)
-
-# Step 3: Create Container
-echo -e "${YELLOW}[3/6]${NC} Creating storage container..."
-if az storage container show --name "$CONTAINER_NAME" --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" &> /dev/null; then
-    echo -e "${GREEN}  ✓ Container already exists${NC}"
-else
-    az storage container create \
-        --name "$CONTAINER_NAME" \
-        --account-name "$STORAGE_ACCOUNT" \
-        --account-key "$STORAGE_KEY" \
-        --output none
-    echo -e "${GREEN}  ✓ Container created${NC}"
-fi
-
-# Step 4: Upload Role Mapping (only needed for mapped mode)
-echo -e "${YELLOW}[4/6]${NC} Uploading role mapping configuration..."
+echo -e "${YELLOW}[3/4]${NC} Role mapping file..."
 if [ "$MAPPING_MODE" = "mapped" ]; then
-    if [ ! -f "./config/role-mapping.json" ]; then
-        echo -e "${RED}  ✗ role-mapping.json not found in ./config/${NC}"
-        echo -e "${YELLOW}  ⚠ Please ensure config/role-mapping.json exists for mapped mode${NC}"
-        exit 1
-    fi
-
     az storage blob upload \
         --account-name "$STORAGE_ACCOUNT" \
-        --account-key "$STORAGE_KEY" \
-        --container-name "$CONTAINER_NAME" \
+        --container-name config \
         --name role-mapping.json \
-        --file ./config/role-mapping.json \
+        --file "$SCRIPT_DIR/config/role-mapping.json" \
+        --auth-mode key \
+        --only-show-errors \
         --overwrite \
         --output none
-    echo -e "${GREEN}  ✓ Role mapping uploaded${NC}"
+    echo -e "${GREEN}  ✓ Uploaded config/role-mapping.json${NC}"
 else
-    echo -e "${GREEN}  ✓ Skipped (using dynamic mode)${NC}"
+    echo -e "${GREEN}  ✓ Not needed for $MAPPING_MODE mode${NC}"
 fi
 
-# Step 5: Create Parameters File
-echo -e "${YELLOW}[5/6]${NC} Generating deployment parameters..."
-umask 077
-PARAMS_FILE=$(mktemp "${TMPDIR:-/tmp}/azuredeploy.parameters.XXXXXX.json")
-
-# Escape values that may contain backslashes or double quotes
-SCIM_API_KEY_ESC=$(json_escape "$SCIM_API_KEY")
-PM_SITE_URL_ESC=$(json_escape "$PM_SITE_URL")
-PM_USERNAME_ESC=$(json_escape "$PM_USERNAME")
-PM_PASSWORD_ESC=$(json_escape "$PM_PASSWORD")
-
-cat > "$PARAMS_FILE" <<EOF
-{
-  "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
-  "contentVersion": "1.0.0.0",
-  "parameters": {
-    "logicAppName": {
-      "value": "$LOGIC_APP_NAME"
-    },
-    "scimApiKey": {
-      "value": "$SCIM_API_KEY_ESC"
-    },
-    "roleMappingStorageAccountName": {
-      "value": "$STORAGE_ACCOUNT"
-    },
-    "roleMappingContainerName": {
-      "value": "$CONTAINER_NAME"
-    },
-    "updateMode": {
-      "value": "$UPDATE_MODE"
-    },
-    "mappingMode": {
-      "value": "$MAPPING_MODE"
-    },
-    "pollingIntervalMinutes": {
-      "value": $POLLING_INTERVAL
-    },
-    "filterToExistingRoles": {
-      "value": $FILTER_TO_EXISTING_ROLES
-    },
-    "processManagerSiteUrl": {
-      "value": "$PM_SITE_URL_ESC"
-    },
-    "processManagerUsername": {
-      "value": "$PM_USERNAME_ESC"
-    },
-    "processManagerPassword": {
-      "value": "$PM_PASSWORD_ESC"
-    }
-  }
-}
-EOF
-unset SCIM_API_KEY_ESC PM_PASSWORD_ESC
-echo -e "${GREEN}  ✓ Parameters file created${NC}"
-
-# Step 6: Deploy Logic App
-echo -e "${YELLOW}[6/6]${NC} Deploying Logic App (this may take a few minutes)..."
-DEPLOYMENT_OUTPUT=$(az deployment group create \
-    --resource-group "$RESOURCE_GROUP" \
-    --template-file ./logic-app/azuredeploy.json \
-    --parameters "$PARAMS_FILE" \
-    --output json 2>&1) || true
-
-if echo "$DEPLOYMENT_OUTPUT" | grep -q '"provisioningState": "Succeeded"'; then
-    echo -e "${GREEN}  ✓ Logic App deployed successfully${NC}"
-else
-    echo -e "${RED}  ✗ Deployment failed${NC}"
-    echo -e "${RED}  Error details:${NC}"
-    echo "$DEPLOYMENT_OUTPUT" | head -50
+echo -e "${YELLOW}[4/4]${NC} Microsoft Graph permissions..."
+if ! "$SCRIPT_DIR/scripts/grant-permissions.sh" "$RESOURCE_GROUP" "$LOGIC_APP_NAME"; then
+    echo -e "${YELLOW}  ⚠ Couldn't grant permissions with your account, so the sync is still switched off.${NC}"
+    echo "    Ask an Entra ID Global Administrator to run this, which grants access and switches it on:"
+    echo "     ./scripts/grant-permissions.sh $RESOURCE_GROUP $LOGIC_APP_NAME"
     exit 1
 fi
 
 echo ""
-echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║              Deployment Complete!                          ║${NC}"
-echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${GREEN}Installation complete.${NC}"
 echo ""
-echo -e "${YELLOW}Next Steps:${NC}"
+echo "The first check has just run; after that it checks every $POLLING_INTERVAL minutes."
+echo "To test: change a user's ${ROLE_SOURCE/both/department or groups} in Entra ID, wait for the next run, and check their roles in Process Manager."
 echo ""
-echo -e "1. ${YELLOW}Authorize the Office 365 API Connection:${NC}"
-echo "   - Go to: https://portal.azure.com/#resource/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Web/connections"
-echo "   - Click on the 'office365-*' connection"
-echo "   - Click 'Edit API connection'"
-echo "   - Click 'Authorize' and sign in"
-echo "   - Click 'Save'"
-echo ""
-echo -e "2. ${YELLOW}Verify the Logic App is enabled:${NC}"
-echo "   az logic workflow show --resource-group $RESOURCE_GROUP --name $LOGIC_APP_NAME --query 'state'"
-echo ""
-echo -e "3. ${YELLOW}Test the deployment:${NC}"
-echo "   - Update a user's department in Entra ID"
-echo "   - Monitor Logic App runs in Azure Portal"
-echo "   - Verify roles are updated in Process Manager"
-echo ""
-echo -e "4. ${YELLOW}View Logic App in Azure Portal:${NC}"
-echo "   https://portal.azure.com/#resource/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Logic/workflows/$LOGIC_APP_NAME"
-echo ""
-echo -e "${GREEN}For detailed testing instructions, see TESTING.md${NC}"
-echo ""
-echo -e "${YELLOW}Note:${NC} This Logic App syncs BOTH departments AND group memberships to roles."
-echo "When a user is updated in Entra ID, their department and all group memberships"
-echo "will be mapped to Process Manager roles and assigned to the user."
-echo ""
+echo "Run history: https://portal.azure.com/#resource/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Logic/workflows/$LOGIC_APP_NAME/logicApp"

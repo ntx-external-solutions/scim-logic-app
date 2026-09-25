@@ -1,0 +1,244 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "config": {
+      "basics": {
+        "description": "**Process Manager SCIM Sync** keeps Process Manager roles in step with Entra ID. It checks Entra ID for changes every few minutes and updates the affected people in Process Manager.\n\nNot sure what to pick? The defaults (Department, use names as they are, managed updates) are a good start. See [Choosing your setup](https://github.com/ntx-external-solutions/scim-logic-app/blob/main/docs/CHOOSING-YOUR-SETUP.md).",
+        "location": {
+          "label": "Region",
+          "toolTip": "Where the Logic App runs. Any region works; pick one close to you."
+        }
+      }
+    },
+    "basics": [
+      {
+        "name": "scimApiKey",
+        "type": "Microsoft.Common.PasswordBox",
+        "label": {
+          "password": "Process Manager SCIM API token",
+          "confirmPassword": "Confirm token"
+        },
+        "toolTip": "In Process Manager: My Profile > Access Tokens. Generate a token and paste it here.",
+        "constraints": {
+          "required": true
+        },
+        "options": {
+          "hideConfirmation": true
+        }
+      }
+    ],
+    "steps": [
+      {
+        "name": "roles",
+        "label": "How roles are chosen",
+        "elements": [
+          {
+            "name": "roleSource",
+            "type": "Microsoft.Common.OptionsGroup",
+            "label": "What decides someone's Process Manager roles?",
+            "defaultValue": "Their department",
+            "toolTip": "Department: the Department field on their Entra ID profile (one role each). Groups: the Entra ID groups they belong to. Both: department and groups together.",
+            "constraints": {
+              "allowedValues": [
+                {
+                  "label": "Their department",
+                  "value": "department"
+                },
+                {
+                  "label": "Their groups",
+                  "value": "groups"
+                },
+                {
+                  "label": "Both",
+                  "value": "both"
+                }
+              ],
+              "required": true
+            }
+          },
+          {
+            "name": "mappingMode",
+            "type": "Microsoft.Common.DropDown",
+            "label": "How do Entra ID names become role names?",
+            "defaultValue": "Use the names as they are",
+            "toolTip": "See 'Choosing your setup' on GitHub for a comparison.",
+            "constraints": {
+              "allowedValues": [
+                {
+                  "label": "Use the names as they are",
+                  "value": "dynamic"
+                },
+                {
+                  "label": "Translate with a mapping file",
+                  "value": "mapped"
+                },
+                {
+                  "label": "Assign roles in the Entra admin center (Enterprise App)",
+                  "value": "entraAppRoles"
+                }
+              ],
+              "required": true
+            }
+          },
+          {
+            "name": "appRolesNeedGroups",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": "[and(equals(steps('roles').roleSource, 'department'), equals(steps('roles').mappingMode, 'entraAppRoles'))]",
+            "options": {
+              "style": "Error",
+              "text": "Enterprise App roles are assigned to groups and people, not departments. Choose 'Their groups' or 'Both' above, or pick a different option here."
+            }
+          },
+          {
+            "name": "dynamicInfo",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": "[equals(steps('roles').mappingMode, 'dynamic')]",
+            "options": {
+              "style": "Info",
+              "text": "The department or group name is used as the Process Manager role name, exactly as written. With groups, every group someone belongs to becomes a role, so consider the role filter on the next page."
+            }
+          },
+          {
+            "name": "mappedInfo",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": "[equals(steps('roles').mappingMode, 'mapped')]",
+            "options": {
+              "style": "Warning",
+              "text": "After installing, upload your role-mapping.json to the storage account this creates (Containers > config). Until then, runs will stop with a message saying the file is missing.",
+              "uri": "https://github.com/ntx-external-solutions/scim-logic-app/blob/main/docs/CHOOSING-YOUR-SETUP.md#mapping-file-option-a"
+            }
+          },
+          {
+            "name": "entraAppId",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Enterprise App's Application (client) ID",
+            "visible": "[equals(steps('roles').mappingMode, 'entraAppRoles')]",
+            "toolTip": "Printed by scripts/create-role-app.sh, or shown on the Enterprise App's Overview page in the Entra admin center.",
+            "constraints": {
+              "required": "[equals(steps('roles').mappingMode, 'entraAppRoles')]",
+              "regex": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "validationMessage": "Paste the Application (client) ID. It looks like 00000000-0000-0000-0000-000000000000."
+            }
+          },
+          {
+            "name": "updateMode",
+            "type": "Microsoft.Common.DropDown",
+            "label": "What happens to roles people already have?",
+            "defaultValue": "Managed: remove only roles this sync gave (recommended)",
+            "toolTip": "Managed keeps roles added by hand in Process Manager. Preserve never removes anything. Replace makes roles exactly match Entra ID.",
+            "constraints": {
+              "allowedValues": [
+                {
+                  "label": "Managed: remove only roles this sync gave (recommended)",
+                  "value": "managed"
+                },
+                {
+                  "label": "Preserve: only ever add roles",
+                  "value": "preserve"
+                },
+                {
+                  "label": "Replace: make roles exactly match Entra ID",
+                  "value": "replace"
+                }
+              ],
+              "required": true
+            }
+          }
+        ]
+      },
+      {
+        "name": "options",
+        "label": "Options",
+        "elements": [
+          {
+            "name": "pollingIntervalMinutes",
+            "type": "Microsoft.Common.Slider",
+            "label": "Check for changes every (minutes)",
+            "min": 1,
+            "max": 60,
+            "defaultValue": 15,
+            "showStepMarkers": false,
+            "toolTip": "More frequent checks pick changes up sooner but cost a little more. 15 minutes costs roughly a few dollars a month."
+          },
+          {
+            "name": "syncExistingUsersOnFirstRun",
+            "type": "Microsoft.Common.CheckBox",
+            "label": "Update every existing user on the first run",
+            "toolTip": "Otherwise only people whose department or groups change after installation are updated."
+          },
+          {
+            "name": "filterToExistingRoles",
+            "type": "Microsoft.Common.CheckBox",
+            "label": "Only give roles that already exist in Process Manager (role filter)",
+            "toolTip": "Stops Entra ID creating new roles in Process Manager. Needs a Process Manager service account without multi-factor sign-in."
+          },
+          {
+            "name": "processManagerSiteUrl",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Process Manager site URL",
+            "placeholder": "https://demo.promapp.com/yourtenant",
+            "visible": "[steps('options').filterToExistingRoles]",
+            "constraints": {
+              "required": "[steps('options').filterToExistingRoles]",
+              "regex": "^https://.*[^/]$",
+              "validationMessage": "Must start with https:// and not end with a slash."
+            }
+          },
+          {
+            "name": "processManagerUsername",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Service-account username",
+            "visible": "[steps('options').filterToExistingRoles]",
+            "constraints": {
+              "required": "[steps('options').filterToExistingRoles]"
+            }
+          },
+          {
+            "name": "processManagerPassword",
+            "type": "Microsoft.Common.PasswordBox",
+            "label": {
+              "password": "Service-account password",
+              "confirmPassword": "Confirm password"
+            },
+            "visible": "[steps('options').filterToExistingRoles]",
+            "constraints": {
+              "required": "[steps('options').filterToExistingRoles]"
+            },
+            "options": {
+              "hideConfirmation": true
+            }
+          },
+          {
+            "name": "logicAppName",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Logic App name",
+            "defaultValue": "ProcessManagerSCIMSync",
+            "toolTip": "Change only if you're installing more than one copy in the same resource group.",
+            "constraints": {
+              "required": true,
+              "regex": "^[a-zA-Z0-9-]{1,80}$",
+              "validationMessage": "Letters, numbers and hyphens only."
+            }
+          }
+        ]
+      }
+    ],
+    "outputs": {
+      "location": "[location()]",
+      "scimApiKey": "[basics('scimApiKey')]",
+      "roleSource": "[steps('roles').roleSource]",
+      "mappingMode": "[steps('roles').mappingMode]",
+      "entraAppId": "[coalesce(steps('roles').entraAppId, '')]",
+      "updateMode": "[steps('roles').updateMode]",
+      "pollingIntervalMinutes": "[steps('options').pollingIntervalMinutes]",
+      "syncExistingUsersOnFirstRun": "[steps('options').syncExistingUsersOnFirstRun]",
+      "filterToExistingRoles": "[steps('options').filterToExistingRoles]",
+      "processManagerSiteUrl": "[coalesce(steps('options').processManagerSiteUrl, '')]",
+      "processManagerUsername": "[coalesce(steps('options').processManagerUsername, '')]",
+      "processManagerPassword": "[coalesce(steps('options').processManagerPassword, '')]",
+      "logicAppName": "[steps('options').logicAppName]"
+    }
+  }
+}
