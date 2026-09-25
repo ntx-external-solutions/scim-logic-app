@@ -1,478 +1,74 @@
-# Azure Logic App - Process Manager SCIM Sync
+# Process Manager SCIM Sync
 
-Automatically sync Entra ID departments and group memberships to Process Manager roles.
+Keep **Nintex Process Manager** roles in step with **Microsoft Entra ID** (formerly Azure AD), automatically.
 
-[![Azure](https://img.shields.io/badge/Azure-Logic%20Apps-0078D4?logo=microsoft-azure)](https://azure.microsoft.com/en-us/products/logic-apps)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+When someone changes department or joins a group in Entra ID, their roles in Process Manager are updated within minutes. Nobody has to remember to do it by hand.
 
-## What It Does
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fntx-external-solutions%2Fscim-logic-app%2Fmain%2Flogic-app%2Fazuredeploy.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Fntx-external-solutions%2Fscim-logic-app%2Fmain%2Flogic-app%2FcreateUiDefinition.json)
 
-This Azure Logic App automatically assigns Process Manager roles based on:
-- ✅ User's **department** in Entra ID
-- ✅ User's **group memberships** in Entra ID
+## What it does
 
-When a user is updated in Entra ID, this Logic App:
-1. Retrieves the user's department and all group memberships
-2. Maps them to Process Manager roles (directly or via configuration)
-3. Updates the user's roles in Process Manager via SCIM API
-
-## Quick Start
-
-```bash
-# Clone or download this repository
-git clone <repository-url>
-
-# Run the automated deployment
-./deploy.sh
+```mermaid
+flowchart LR
+    A["Someone's department<br/>or groups change<br/>in Entra ID"] --> B["Every 15 minutes,<br/>the sync checks<br/>for changes"]
+    B --> C["Works out their<br/>Process Manager roles"]
+    C --> D["Updates them in<br/>Process Manager"]
 ```
 
-See [QUICKSTART.md](./QUICKSTART.md) for a complete 15-minute setup guide.
+You choose:
 
-## Overview
+- **What decides roles:** the person's **department**, their **groups**, or **both**.
+- **How names become roles:**
+  - use the department or group names as they are
+  - translate them with a short mapping file
+  - assign roles to groups in the **Entra admin center**, just like giving a group access to an app
+- **What happens to existing roles:** by default the sync only removes roles *it* gave out, and roles added by hand in Process Manager are left alone.
 
-This Azure Logic App provides a workaround for the missing PATCH support in Process Manager's SCIM API.
+Not sure which to pick? [Choosing your setup](docs/CHOOSING-YOUR-SETUP.md) explains each option with examples. The defaults (department, names as-is) are a fine place to start, and you can change them later.
 
-### How It Works
+## What you need
 
-When a user is updated in Entra ID, the Logic App:
+| | Who usually has it |
+|---|---|
+| An Azure subscription, with permission to create resources and assign access (**Owner** role) | Your Azure / cloud team |
+| An Entra ID **Global Administrator** (or Privileged Role Administrator) for one 2-minute step | Your identity / Microsoft 365 admin |
+| A Process Manager **SCIM API token** | Your Process Manager administrator (My Profile → Access Tokens) |
 
-1. **Detects** the user update via webhook trigger
-2. **Retrieves** the user's department AND all group memberships from Entra ID
-3. **Maps** both department and groups to Process Manager roles (dynamic or mapped mode)
-4. **Combines** all roles without duplicates
-5. **Queries** the SCIM API to find the user
-6. **Updates** the user's roles in Process Manager using a single PUT request
+People must already exist in Process Manager: the sync updates their roles but doesn't create accounts. It matches people by email address.
 
-## Architecture
+## Install
 
-```
-Entra ID User Update
-         ↓
-   Webhook Trigger
-         ↓
-   Get User Profile & Group Memberships
-         ↓
- Map Department + Groups → Roles
-         ↓
-   Combine All Roles
-         ↓
-  Find User in SCIM API
-         ↓
-Update User with All Roles
-```
+**About 15 minutes**, all in your web browser.
 
-**Key Features:**
-- Single unified workflow
-- Combines department and group-based roles
-- Automatic deduplication
-- Configurable mapping modes (dynamic or mapped)
-- Optional **role filter** to prevent AD groups/departments from creating new roles in Process Manager
-- Preserve or replace existing roles
+1. Click **Deploy to Azure** above and fill in the form.
+2. Open **Azure Cloud Shell** and run one command to give the sync read access to Entra ID.
+3. Test it by changing someone's department.
 
-## Mapping Modes
+Step-by-step instructions, with what to click: **[Setup guide](docs/SETUP.md)**.
 
-The Logic App supports two modes for mapping Entra ID departments and groups to Process Manager roles:
+Prefer the command line? Run `./deploy.sh` from this repository. It asks the same questions and does all three steps.
 
-### Dynamic Mode (Recommended)
+## Cost
 
-Uses the Entra ID department name or group name directly as the Process Manager role name. This provides a 1:1 mapping with no configuration file needed.
+Typically **$2–4 a month** in Azure charges at the default 15-minute check interval. It runs on a Logic App (pay-per-use; the first 4,000 actions each month are free) and a small storage account (pennies). Checking every 5 minutes costs roughly three times as much. Nothing else is billed: no servers, no databases, no licences.
 
-**Use when:**
-- Your department names in Entra ID exactly match role names in Process Manager
-- Your group names in Entra ID exactly match role names in Process Manager
-- You want simple, straightforward mapping with no overhead
-- You don't need flexible or custom mappings
+The optional *Enterprise App roles* mapping has no Azure cost. Assigning **groups** to an Enterprise App does need Entra ID P1 or P2, which is included in Microsoft 365 E3, E5 and Business Premium.
 
-**Examples:**
-- Entra ID Department: "Engineering" → Process Manager Role: "Engineering"
-- Entra ID Group: "ProcessManager-Admins" → Process Manager Role: "ProcessManager-Admins"
+## Documentation
 
-### Mapped Mode
+| | |
+|---|---|
+| [Setup guide](docs/SETUP.md) | Installing, step by step |
+| [Choosing your setup](docs/CHOOSING-YOUR-SETUP.md) | Department vs groups, the three mapping options, and update modes |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | What to do when a run fails or a role doesn't change |
 
-Uses a configuration file (`role-mapping.json`) to map department names and group names to role names. This provides flexibility when names don't match or you need custom mappings.
+## Security
 
-**Use when:**
-- Department/group names in Entra ID differ from role names in Process Manager
-- You need multiple departments/groups to map to the same role
-- You want a default/fallback role for unmapped departments/groups
-
-**Examples:**
-- Entra ID Department: "Eng" → Mapped to Process Manager Role: "Engineering Team"
-- Entra ID Group: "PM-Editors" → Mapped to Process Manager Role: "Process Editor"
-
-### Role Filter (Optional)
-
-Either mode can be combined with the **role filter** (`filterToExistingRoles: true`) to prevent role bloat in Process Manager. When enabled, the Logic App fetches the current list of roles from Process Manager at the start of each run and only syncs departments/groups whose names already exist there.
-
-**Use when:**
-- You don't want every AD group a user belongs to to be created as a new role in Process Manager
-- You want Process Manager to remain the source of truth for which roles exist
-- You need Entra ID → Process Manager sync without Process Manager → Entra ID pollution
-
-**How it works:**
-- The Logic App calls `POST {processManagerSiteUrl}/oauth2/token` with the configured service-account credentials
-- Then `GET {processManagerSiteUrl}/Lookup/AssociateRoles.aspx` to retrieve the HTML list of roles
-- Extracts and normalizes role names, then filters user departments/groups against them (case-insensitive, whitespace-trimmed)
-
-**Recommended combination:** `mappingMode: dynamic` + `filterToExistingRoles: true`.
-
-See [MAPPING_MODES.md](./MAPPING_MODES.md#filtering-to-existing-process-manager-roles) for full details, monitoring guidance, and caveats.
-
-## Prerequisites
-
-1. **Azure Subscription** with permissions to create:
-   - Logic Apps
-   - Storage Accounts
-   - API Connections
-
-2. **Entra ID (Azure AD)** with:
-   - Global Administrator or appropriate permissions to set up webhooks
-   - Users with the "Department" field populated
-
-3. **Process Manager SCIM API**:
-   - SCIM API enabled in your Process Manager instance
-   - Valid Bearer token (API key)
-   - Roles configured that match your mapping
-
-4. **Process Manager service account** (only if enabling `filterToExistingRoles`):
-   - Dedicated user in Process Manager with permission to view the roles list
-   - Username and password stored in ARM parameters (or ideally Key Vault)
-   - **Not** MFA-enforced — the OAuth password-grant flow doesn't support MFA
-
-5. **Azure CLI** or **Azure PowerShell** installed locally
-
-## Deployment Steps
-
-### Step 1: Create Storage Account for Configuration
-
-The role mapping configuration needs to be stored in Azure Blob Storage.
-
-```bash
-# Set your variables
-RESOURCE_GROUP="rg-processmanager-scim"
-LOCATION="eastus"
-STORAGE_ACCOUNT="pmscimconfig$(date +%s)"  # Must be globally unique
-CONTAINER_NAME="config"
-
-# Create resource group
-az group create --name $RESOURCE_GROUP --location $LOCATION
-
-# Create storage account
-az storage account create \
-  --name $STORAGE_ACCOUNT \
-  --resource-group $RESOURCE_GROUP \
-  --location $LOCATION \
-  --sku Standard_LRS \
-  --kind StorageV2
-
-# Get storage account key
-STORAGE_KEY=$(az storage account keys list \
-  --resource-group $RESOURCE_GROUP \
-  --account-name $STORAGE_ACCOUNT \
-  --query '[0].value' -o tsv)
-
-# Create container
-az storage container create \
-  --name $CONTAINER_NAME \
-  --account-name $STORAGE_ACCOUNT \
-  --account-key $STORAGE_KEY
-```
-
-### Step 2: Upload Role Mapping Configuration (Mapped Mode Only)
-
-**Note:** Skip this step if you're using **dynamic mode** (recommended for 1:1 department-to-role mapping).
-
-```bash
-# Upload the role mapping file (only needed for mapped mode)
-az storage blob upload \
-  --account-name $STORAGE_ACCOUNT \
-  --account-key $STORAGE_KEY \
-  --container-name $CONTAINER_NAME \
-  --name role-mapping.json \
-  --file ./config/role-mapping.json
-```
-
-**Important:** Edit `config/role-mapping.json` to match your organization's departments and Process Manager roles before uploading.
-
-### Step 3: Update Deployment Parameters
-
-Edit `logic-app/azuredeploy.parameters.json`:
-
-```json
-{
-  "parameters": {
-    "logicAppName": {
-      "value": "ProcessManagerSCIMSync"
-    },
-    "scimApiKey": {
-      "value": "YOUR_SCIM_BEARER_TOKEN_HERE"
-    },
-    "roleMappingStorageAccountName": {
-      "value": "pmscimconfig1234567890"
-    },
-    "roleMappingContainerName": {
-      "value": "config"
-    },
-    "updateMode": {
-      "value": "preserve"
-    },
-    "mappingMode": {
-      "value": "dynamic"
-    },
-    "filterToExistingRoles": {
-      "value": false
-    },
-    "processManagerSiteUrl": {
-      "value": ""
-    },
-    "processManagerUsername": {
-      "value": ""
-    },
-    "processManagerPassword": {
-      "value": ""
-    }
-  }
-}
-```
-
-**Parameters:**
-- `scimApiKey`: Your Process Manager SCIM Bearer token (found in Admin → SCIM)
-- `roleMappingStorageAccountName`: The storage account name from Step 1
-- `mappingMode`:
-  - `dynamic`: Use department name directly as role (1:1 mapping) - **Recommended**
-  - `mapped`: Use role-mapping.json for custom mappings
-- `updateMode`:
-  - `preserve`: Adds the department role while keeping existing roles
-  - `replace`: Replaces all roles with only the department role
-- `filterToExistingRoles`: `true` to filter user groups/departments to only those that already exist as roles in Process Manager. Prevents AD groups from creating new roles in PM. Default `false`. See [MAPPING_MODES.md](./MAPPING_MODES.md#filtering-to-existing-process-manager-roles).
-- `processManagerSiteUrl`: Process Manager tenant base URL, e.g. `https://{tenant}.promapp.com/{tenantId}`. **No trailing slash.** Required when `filterToExistingRoles` is `true`.
-- `processManagerUsername`: Process Manager service-account username used for the OAuth password-grant token request. Required when `filterToExistingRoles` is `true`.
-- `processManagerPassword`: Process Manager service-account password (securestring). Required when `filterToExistingRoles` is `true`.
-
-### Step 4: Deploy the Logic App
-
-```bash
-# Deploy using Azure CLI
-az deployment group create \
-  --resource-group $RESOURCE_GROUP \
-  --template-file ./logic-app/azuredeploy.json \
-  --parameters ./logic-app/azuredeploy.parameters.json
-```
-
-### Step 5: Authorize API Connections
-
-After deployment, you need to authorize the Office 365 connection:
-
-1. Go to the Azure Portal
-2. Navigate to your Resource Group
-3. Find the API Connection resource named `office365-xxxxx`
-4. Click **Edit API connection**
-5. Click **Authorize** and sign in with your Entra ID admin account
-6. Click **Save**
-
-### Step 6: Enable the Logic App
-
-The Logic App should start automatically. Verify it's enabled:
-
-```bash
-az logic workflow show \
-  --resource-group $RESOURCE_GROUP \
-  --name ProcessManagerSCIMSync \
-  --query "state"
-```
-
-Expected output: `"Enabled"`
-
-## Configuration
-
-### Dynamic Mode (Default)
-
-No additional configuration needed! The Logic App uses the Entra ID department name directly as the Process Manager role.
-
-**Requirements:**
-- Department names in Entra ID must exactly match role names in Process Manager
-- Case-sensitive matching
-
-### Mapped Mode Configuration
-
-**Only needed if you set `mappingMode` to `"mapped"`**
-
-The `config/role-mapping.json` file controls how Entra ID departments and groups map to Process Manager roles:
-
-```json
-{
-  "departmentMapping": {
-    "Eng": "Engineering Team",
-    "Sales Dept": "Sales Team",
-    "HR": "Human Resources",
-    "_default": "Standard User"
-  },
-  "groupMapping": {
-    "ProcessManager-Admins": "Administrator",
-    "ProcessManager-Editors": "Process Editor",
-    "ProcessManager-Viewers": "Process Viewer",
-    "_default": "Standard User"
-  }
-}
-```
-
-- **departmentMapping**: Maps Entra ID department names to Process Manager roles
-- **groupMapping**: Maps Entra ID group names to Process Manager roles
-- **Keys**: Exact department/group name from Entra ID
-- **Values**: Exact role display name from Process Manager
-- **_default**: Fallback role when no mapping is found
-
-To update the mapping after deployment:
-
-```bash
-# Edit the file locally, then re-upload
-az storage blob upload \
-  --account-name $STORAGE_ACCOUNT \
-  --account-key $STORAGE_KEY \
-  --container-name $CONTAINER_NAME \
-  --name role-mapping.json \
-  --file ./config/role-mapping.json \
-  --overwrite
-```
-
-The Logic App will use the updated mapping on the next trigger (no restart needed).
-
-## How Department and Group Sync Work Together
-
-Both workflows can run simultaneously and complement each other:
-
-**Preserve Mode (Default):**
-- Department sync adds department-based role
-- Group sync adds group-based roles
-- All roles are combined (no duplicates)
-- Example: User in "Engineering" department + "ProcessManager-Admins" group gets both "Engineering" and "Administrator" roles
-
-**Replace Mode:**
-- Whichever workflow runs last will replace all roles
-- Not recommended when using both department and group sync together
-- Best for single-source-of-truth scenarios
-
-**Recommended Configuration:**
-- Use **Preserve Mode** when using both department and group sync
-- Use **Mapped Mode** with explicit mappings to control exactly which groups/departments assign which roles
-
-## Update Modes
-
-### Preserve Mode (Default)
-Adds the department/group-based role without removing existing roles.
-
-**Example:**
-- User has roles: `["Admin", "Process Editor"]`
-- Department maps to: `"Engineering Team"`
-- Result: `["Admin", "Process Editor", "Engineering Team"]`
-
-### Replace Mode
-Replaces all existing roles with only the department role.
-
-**Example:**
-- User has roles: `["Admin", "Process Editor"]`
-- Department maps to: `"Engineering Team"`
-- Result: `["Engineering Team"]`
-
-To change modes, update the `updateMode` parameter and redeploy.
-
-## Monitoring
-
-### View Logic App Runs
-
-```bash
-# List recent runs
-az logic workflow run list \
-  --resource-group $RESOURCE_GROUP \
-  --name ProcessManagerSCIMSync \
-  --top 10
-
-# View specific run details
-az logic workflow run show \
-  --resource-group $RESOURCE_GROUP \
-  --name ProcessManagerSCIMSync \
-  --run-name <run-id>
-```
-
-### Azure Portal Monitoring
-
-1. Navigate to your Logic App in the Azure Portal
-2. Click **Overview** to see run history
-3. Click on any run to see detailed execution steps
-4. Check for failed runs and error messages
-
-### Common Issues
-
-**Logic App not triggering:**
-- Verify the Office 365 API connection is authorized
-- Check that the webhook subscription is active in Entra ID
-- Ensure the Logic App is in "Enabled" state
-
-**User not found in SCIM:**
-- Verify the user exists in Process Manager
-- Check that the email in Entra ID matches the userName in SCIM
-- Ensure the SCIM API key is valid
-
-**Role not updating:**
-- **Dynamic mode**: Verify the department/group name in Entra ID exactly matches the role name in Process Manager (case-sensitive)
-- **Mapped mode**: Verify the role name in the mapping file exactly matches Process Manager
-- Check that the role exists in Process Manager
-- Review the Logic App run history for specific error messages
-- For group sync: Verify the user is actually a member of the expected groups
-
-**Authentication errors:**
-- Verify the SCIM API key is correct and not expired
-- Check that the API key has appropriate permissions
-
-**Role filter errors (`filterToExistingRoles: true`):**
-- **`Get_PM_oauth_token` fails with 400/401**: service-account username/password or site URL is wrong, or the account has MFA enforced (password grant doesn't support MFA). Test `POST {processManagerSiteUrl}/oauth2/token` with `curl` to verify.
-- **`Get_PM_roles_html` fails with 401**: the token was issued but rejected by the roles endpoint — the service account likely lacks permission to view the roles list. Log in as that account in Process Manager and confirm they can see roles.
-- **Filter appears to be a no-op** (all AD groups still being synced): inspect the `Set_valid_roles_lower` action output in the run history. If the array is empty, the HTML parser may be broken. If it has entries but the expected role is missing, the role name in PM probably doesn't match the AD group name after case/whitespace normalization.
-- **Service account keeps getting locked**: wrong credentials cause every polling run to hit the token endpoint. Temporarily set `filterToExistingRoles: false`, fix the credentials, then re-enable.
-
-## Testing
-
-See `TESTING.md` for detailed testing procedures.
-
-## Cleanup
-
-To remove all resources:
-
-```bash
-az group delete --name $RESOURCE_GROUP --yes --no-wait
-```
-
-## Security Considerations
-
-1. **API Key Storage**: The SCIM API key is stored as a secure parameter in the Logic App. It's encrypted at rest but visible to anyone with access to the Logic App definition.
-
-2. **API Connection Authentication**: The Office 365 connection uses OAuth and doesn't store passwords.
-
-3. **Storage Account Access**: The storage account key is used by the Logic App connection. Consider using Managed Identity for enhanced security.
-
-4. **Network Security**: Consider restricting the Logic App to a Virtual Network if your security requirements demand it.
-
-## Cost Estimates
-
-Approximate monthly costs (based on East US pricing):
-
-- **Logic App**: $0.000125 per action execution
-  - Assuming 1000 user updates/month × 8 actions = $1.00/month
-- **Storage Account**: ~$0.01/month for config file
-- **API Connections**: No additional cost
-
-**Total estimated cost**: ~$1-2/month for typical usage
+- The sync signs in to Microsoft Graph and Azure Storage with its own **managed identity**, so no passwords or keys are stored for either.
+- It only ever **reads** Entra ID. The permissions it's granted are read-only.
+- The Process Manager SCIM token is stored as a secure parameter in the Logic App. It's hidden from run history, but anyone who can edit the Logic App can see it. Limit who has access to the resource group.
+- If you use the role filter, its Process Manager service-account password is stored the same way.
 
 ## Support
 
-For issues related to:
-- **Logic App deployment**: Check Azure deployment logs
-- **SCIM API**: Contact Nintex support
-- **Entra ID webhooks**: Check Azure AD audit logs
-
-## Future Enhancements
-
-Once Process Manager supports SCIM PATCH:
-1. Update the Logic App to use PATCH instead of PUT
-2. This will allow partial updates without fetching the full user object
-3. Reduced risk of overwriting other fields during concurrent updates
+This is a community solution, not an official Nintex product. For problems with the sync itself, open an issue on this repository. For Process Manager or the SCIM API, contact Nintex support.

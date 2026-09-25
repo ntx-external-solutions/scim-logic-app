@@ -6,22 +6,25 @@
       "value": "ProcessManagerSCIMSync"
     },
     "scimApiKey": {
-      "value": "YOUR_SCIM_API_KEY_HERE"
+      "value": "YOUR_SCIM_API_TOKEN"
     },
-    "roleMappingStorageAccountName": {
-      "value": "YOUR_STORAGE_ACCOUNT_NAME"
-    },
-    "roleMappingContainerName": {
-      "value": "config"
-    },
-    "updateMode": {
-      "value": "preserve"
+    "roleSource": {
+      "value": "department"
     },
     "mappingMode": {
       "value": "dynamic"
     },
+    "entraAppId": {
+      "value": ""
+    },
+    "updateMode": {
+      "value": "managed"
+    },
     "pollingIntervalMinutes": {
-      "value": 5
+      "value": 15
+    },
+    "syncExistingUsersOnFirstRun": {
+      "value": false
     },
     "filterToExistingRoles": {
       "value": false
